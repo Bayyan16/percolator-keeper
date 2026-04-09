@@ -432,11 +432,15 @@ export class CrankService {
       const programId = market.programId;
 
       // ── HYPERP mode: permissionless on-chain oracle ──────────────────────
-      // True HYPERP markets (oracle_authority=[0;32], index_feed_id=[0;32]) use
-      // UpdateHyperpMark to read DEX pool state directly on-chain. No off-chain
-      // price push needed — the instruction reads Raydium/PumpSwap/Meteora pools.
+      // True HYPERP markets (oracle_authority=[0;32], index_feed_id=[0;32]).
+      // NOTE: UpdateHyperpMark (tag 34) does NOT exist in the V12_1 upstream rebase.
+      // The mark price comes from mark_ewma_e6 (trade-derived) or authority_price_e6.
+      // We skip the UpdateHyperpMark instruction and only send KeeperCrank.
       if (this.isHyperpOracle(market)) {
         const instructions = [];
+        // SKIP UpdateHyperpMark — tag 34 not in V12_1 decode table.
+        // Mark price uses initial value until trades generate EWMA updates.
+        const SKIP_UPDATE_HYPERP_MARK = true;
 
         // UpdateHyperpMark: accounts = [slab(writable), dex_pool, clock, ...remaining]
         //
@@ -483,9 +487,8 @@ export class CrankService {
             });
           }
           // No pool address → skip oracle update but still crank (funding/liquidation still work)
-        } else {
-          // Build UpdateHyperpMark instruction. If this fails, throw so KeeperCrank
-          // is NOT sent with a stale oracle — avoids OracleInvalid (0xc) on-chain.
+        } else if (!SKIP_UPDATE_HYPERP_MARK) {
+          // Build UpdateHyperpMark instruction — DISABLED for V12_1 (tag 34 removed).
           const hyperpData = encodeUpdateHyperpMark();
           const poolKey = new PublicKey(effectiveDexPoolAddress);
 
