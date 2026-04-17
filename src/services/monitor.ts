@@ -18,7 +18,7 @@ import {
   fetchSlab,
   parseEngine,
   parseConfig,
-} from "@percolator/sdk";
+} from "@percolatorct/sdk";
 import {
   getConnection,
   createLogger,

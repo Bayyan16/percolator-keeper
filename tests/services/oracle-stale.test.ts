@@ -75,32 +75,9 @@ describe('OracleService.getStaleMarkets', () => {
     expect(stale).toContain('SLAB_A');
   });
 
-  it('should not return markets with recent push', async () => {
-    const solMint = 'So11111111111111111111111111111111111111112';
-    // Use a valid base58 pubkey as slab address (pushPrice creates a PublicKey from it)
-    const slabAddr = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
-
-    const mockMarketConfig: any = {
-      collateralMint: new PublicKey(solMint),
-      oracleAuthority: new PublicKey('11111111111111111111111111111111'),
-      authorityPriceE6: 1_000_000n,
-    };
-
-    vi.mocked(fetch)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }] }),
-      } as any)
-      .mockResolvedValueOnce({
-        ok: true, json: async () => ({ data: { [solMint]: { price: '1.00' } } }),
-      } as any);
-
-    const pushed = await oracle.pushPrice(slabAddr, mockMarketConfig);
-    expect(pushed).toBe(true);
-
-    // Should not be stale (push was just now, threshold is 5 minutes)
-    const stale = oracle.getStaleMarkets(5 * 60 * 1000);
-    expect(stale).not.toContain(slabAddr);
-  });
+  // "should not return markets with recent push" test removed — pushPrice
+  // was deleted in Phase G. The getStaleMarkets logic now depends on
+  // recordPushTime calls from external oracle sources instead.
 
   it('should distinguish between 5min alert and 10min pause thresholds', async () => {
     // We'll test the logic by checking that the same market appears

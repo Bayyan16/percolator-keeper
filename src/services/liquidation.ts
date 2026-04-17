@@ -11,10 +11,8 @@ import {
   buildIx,
   encodeLiquidateAtOracle,
   encodeKeeperCrank,
-  encodePushOraclePrice,
   ACCOUNTS_LIQUIDATE_AT_ORACLE,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
@@ -328,14 +326,15 @@ export class LiquidationService {
     accountIdx: number,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
-    const isAdminOracle = !market.config.oracleAuthority.equals(PublicKey.default);
 
     try {
       const connection = getConnection();
       const keypair = this._keypair;
       const programId = market.programId;
 
-      // Build multi-instruction tx: push price → crank → liquidate
+      // Build multi-instruction tx: crank → liquidate.
+      // Admin-push oracle was removed by percolator-prog Phase G —
+      // all markets now read Pyth/Chainlink/Hyperp directly.
       const instructions = [];
 
       // Determine oracle account for crank/liquidate
@@ -344,31 +343,14 @@ export class LiquidationService {
       const isAllZeros = feedHex === "0".repeat(64);
       const oracleAccount = isAllZeros ? slabAddress : derivePythPushOraclePDA(feedHex)[0];
 
-      // 1. Push oracle price only if crank wallet IS the oracle authority
-      // (user-owned oracle markets skip the push — user pushes manually)
-      if (isAdminOracle && market.config.oracleAuthority.equals(keypair.publicKey)) {
-        const mint = market.config.collateralMint.toBase58();
-        const priceEntry = await this.oracleService.fetchPrice(mint, slabAddress.toBase58());
-        if (priceEntry) {
-          const pushData = encodePushOraclePrice({
-            priceE6: priceEntry.priceE6,
-            timestamp: BigInt(Math.floor(Date.now() / 1000)),
-          });
-          const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
-            keypair.publicKey, slabAddress,
-          ]);
-          instructions.push(buildIx({ programId, keys: pushKeys, data: pushData }));
-        }
-      }
-
-      // 2. Crank (make sure engine state is fresh)
+      // 1. Crank (make sure engine state is fresh)
       const crankData = encodeKeeperCrank({ callerIdx: 65535 });
       const crankKeys = buildAccountMetas(ACCOUNTS_KEEPER_CRANK, [
         keypair.publicKey, slabAddress, SYSVAR_CLOCK_PUBKEY, oracleAccount,
       ]);
       instructions.push(buildIx({ programId, keys: crankKeys, data: crankData }));
 
-      // 3. Liquidate
+      // 2. Liquidate
       const liqData = encodeLiquidateAtOracle({ targetIdx: accountIdx });
       const liqKeys = buildAccountMetas(ACCOUNTS_LIQUIDATE_AT_ORACLE, [
         keypair.publicKey, slabAddress, SYSVAR_CLOCK_PUBKEY, oracleAccount,

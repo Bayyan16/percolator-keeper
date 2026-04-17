@@ -334,59 +334,9 @@ describe('OracleService', () => {
     });
   });
 
-  describe('rate limiting', () => {
-    it('should respect rate limit for pushPrice', async () => {
-      const mockMarketConfig: any = {
-        collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
-        oracleAuthority: new PublicKey('11111111111111111111111111111111'),
-        authorityPriceE6: 1_000_000n,
-      };
-
-      vi.mocked(fetch).mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
-        }),
-      } as any);
-
-      const slab = 'FxfD37s1AZTeWfFQps9Zpebi2dNQ9QSSDtfMKdbsfKrD';
-
-      // First push should succeed
-      const result1 = await oracleService.pushPrice(slab, mockMarketConfig);
-      expect(result1).toBe(true);
-
-      // Second push within rate limit should be skipped
-      const result2 = await oracleService.pushPrice(slab, mockMarketConfig);
-      expect(result2).toBe(false);
-    });
-
-    it('should allow pushPrice after rate limit expires', async () => {
-      const mockMarketConfig: any = {
-        collateralMint: new PublicKey('So11111111111111111111111111111111111111112'),
-        oracleAuthority: new PublicKey('11111111111111111111111111111111'),
-        authorityPriceE6: 1_000_000n,
-      };
-
-      vi.mocked(fetch).mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          pairs: [{ priceUsd: '1.00', liquidity: { usd: 100000 } }],
-        }),
-      } as any);
-
-      const slab = 'FwfBKZXbYr4vTK23bMFkbgKq3npJ3MSDxEaKmq9Aj4Qn';
-
-      // First push
-      await oracleService.pushPrice(slab, mockMarketConfig);
-
-      // Wait past rate limit
-      await new Promise(resolve => setTimeout(resolve, 6_000));
-
-      // Second push should succeed
-      const result = await oracleService.pushPrice(slab, mockMarketConfig);
-      expect(result).toBe(true);
-    }, 10000);
-  });
+  // Rate-limiting tests for pushPrice were removed after Phase G — admin-push
+  // oracle is no longer a keeper responsibility. Pyth/Chainlink handle their
+  // own rate limits upstream and Hyperp reads the DEX directly.
 
   describe('price history tracking', () => {
     it('should track price history up to max entries per market', async () => {

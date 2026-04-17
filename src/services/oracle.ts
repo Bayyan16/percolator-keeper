@@ -1,12 +1,8 @@
 import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
-  encodePushOraclePrice,
-  buildAccountMetas,
-  buildIx,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   type MarketConfig,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolator/shared";
+import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolator/shared";
 
 const logger = createLogger("keeper:oracle");
 
@@ -335,97 +331,6 @@ export class OracleService {
         }
       }
       if (oldestKey) this.priceHistory.delete(oldestKey);
-    }
-  }
-
-  /** Push oracle price on-chain for admin-oracle market */
-  async pushPrice(slabAddress: string, marketConfig: MarketConfig, marketProgramId?: PublicKey): Promise<boolean> {
-    const now = Date.now();
-    const lastPush = this.lastPushTime.get(slabAddress) ?? 0;
-    if (now - lastPush < this.rateLimitMs) return false;
-
-    // For coin-margined markets (collateral IS the index token), use collateralMint
-    // For USDC-margined markets, we'd need a separate indexMint field
-    // Currently all percolator markets are coin-margined, so collateralMint is correct
-    const mint = marketConfig.collateralMint.toBase58();
-    let priceEntry = await this.fetchPrice(mint, slabAddress);
-
-    // Fallback for devnet test tokens with no external price source:
-    // use the last on-chain authority price, or default to 1.0
-    if (!priceEntry) {
-      const onChainPrice = marketConfig.authorityPriceE6;
-      if (onChainPrice > 0n) {
-        // M-4: Guard against infinite stale loop. If all external sources have been
-        // failing for longer than ON_CHAIN_FALLBACK_MAX_MS, stop pushing the stale
-        // on-chain price. This lets the oracle go stale naturally so the frontend
-        // shows a stale warning and the pause guard can halt trading.
-        const lastExternal = this.lastExternalPriceMs.get(slabAddress) ?? 0;
-        const externalOutageMs = now - lastExternal;
-        if (lastExternal > 0 && externalOutageMs > ON_CHAIN_FALLBACK_MAX_MS) {
-          logger.warn("On-chain fallback exceeded time limit — skipping push to allow oracle to go stale", {
-            mint,
-            slabAddress,
-            externalOutageSeconds: Math.round(externalOutageMs / 1000),
-            limitSeconds: ON_CHAIN_FALLBACK_MAX_MS / 1000,
-          });
-          return false;
-        }
-        priceEntry = { priceE6: onChainPrice, source: "on-chain", timestamp: Date.now() };
-        logger.info("Using on-chain price", { mint, onChainPrice: onChainPrice.toString() });
-      } else {
-        logger.warn("No price source available", { mint });
-        return false; // Don't push a guessed price
-      }
-    }
-
-    try {
-      const connection = getConnection();
-      const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
-      const slabPubkey = new PublicKey(slabAddress);
-      const programId = marketProgramId ?? new PublicKey(config.programId);
-
-      // BC4: Validate that crank keypair is the oracle authority
-      if (!keypair.publicKey.equals(marketConfig.oracleAuthority)) {
-        // Skip silently for markets we don't control — only log once per market
-        if (!this._nonAuthorityLogged.has(slabAddress)) {
-          this._nonAuthorityLogged.add(slabAddress);
-          logger.debug("Not oracle authority, skipping", { slabAddress, ourAuthority: keypair.publicKey.toBase58().slice(0, 8), theirAuthority: marketConfig.oracleAuthority.toBase58().slice(0, 8) });
-        }
-        return false;
-      }
-
-      const data = encodePushOraclePrice({
-        priceE6: priceEntry.priceE6,
-        timestamp: BigInt(Math.floor(Date.now() / 1000)),
-      });
-
-      const keys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
-        keypair.publicKey,
-        slabPubkey,
-      ]);
-
-      const ix = buildIx({ programId, keys, data });
-      logger.debug("Pushing oracle price", { slabAddress, priceE6: priceEntry.priceE6.toString(), programId: programId.toBase58() });
-      const sig = await sendWithRetry(connection, ix, [keypair]);
-      logger.info("Oracle price pushed", { signature: sig });
-
-      this.lastPushTime.set(slabAddress, now);
-      eventBus.publish("price.updated", slabAddress, {
-        priceE6: priceEntry.priceE6.toString(),
-        source: priceEntry.source,
-      });
-      return true;
-    } catch (err) {
-      logger.error("Failed to push oracle price", {
-        slabAddress,
-        error: getErrorMessage(err),
-        stack: err instanceof Error ? err.stack : undefined,
-        mint,
-        priceE6: priceEntry?.priceE6.toString(),
-        source: priceEntry?.source,
-      });
-      
-      return false;
     }
   }
 

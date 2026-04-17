@@ -2,13 +2,11 @@ import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   discoverMarkets,
   encodeKeeperCrank,
-  encodePushOraclePrice,
   encodeUpdateHyperpMark,
   buildAccountMetas,
   buildIx,
   derivePythPushOraclePDA,
   ACCOUNTS_KEEPER_CRANK,
-  ACCOUNTS_PUSH_ORACLE_PRICE,
   fetchSlab,
   parseHeader,
   parseConfig,
@@ -581,64 +579,13 @@ export class CrankService {
         return true;
       }
 
-      // ── Admin-push mode: off-chain price oracle ────────────────────────────
-      // GH#1508: Skip admin-oracle markets where we are NOT the oracle authority.
-      if (this.isAdminOracle(market) && !keypair.publicKey.equals(market.config.oracleAuthority)) {
-        if (!state.foreignOracleSkipped) {
-          state.foreignOracleSkipped = true;
-          logger.warn("Skipping admin-oracle market — keeper is not the oracle authority (would cause OracleInvalid 0xc). " +
-            "The market creator must push prices. Suppressing further crank attempts.", {
-            slabAddress,
-            oracleAuthority: market.config.oracleAuthority.toBase58(),
-            keeperKey: keypair.publicKey.toBase58(),
-            programId: programId.toBase58(),
-          });
-        }
-        return false;
-      }
+      // Admin-push oracle was removed by percolator-prog Phase G — all markets
+      // now read Pyth/Chainlink/Hyperp directly. The foreign-oracle skip, the
+      // bundled price-push, and the admin-hyperp guard that used to live here
+      // are no longer reachable (oracle_authority is zero on all new markets
+      // and the on-chain PushOraclePrice handler was deleted).
 
-      // PERC-204: Build all instructions into a single transaction bundle
       const instructions = [];
-
-      // PERC-204: Bundle oracle price push with crank tx
-      let pricePushQueued = false;
-      if (this.isAdminOracle(market) && keypair.publicKey.equals(market.config.oracleAuthority)) {
-        try {
-          const mint = state.mainnetCA ?? market.config.collateralMint.toBase58();
-          const priceEntry = await this.oracleService.fetchPrice(mint, slabAddress);
-          if (priceEntry) {
-            const pushData = encodePushOraclePrice({
-              priceE6: priceEntry.priceE6,
-              timestamp: BigInt(Math.floor(Date.now() / 1000)),
-            });
-            const pushKeys = buildAccountMetas(ACCOUNTS_PUSH_ORACLE_PRICE, [
-              keypair.publicKey, market.slabAddress,
-            ]);
-            instructions.push(buildIx({ programId, keys: pushKeys, data: pushData }));
-            pricePushQueued = true;
-          }
-        } catch (priceErr) {
-          logger.warn("Price push skipped (bundled)", { slabAddress, error: priceErr instanceof Error ? priceErr.message : String(priceErr) });
-        }
-      }
-
-      // PERC-1254: Hyperp-mode guard for admin-oracle markets with zero indexFeedId
-      const isAdminHyperpMode = this.isAdminOracle(market) &&
-        keypair.publicKey.equals(market.config.oracleAuthority) &&
-        market.config.indexFeedId.toBytes().every((b: number) => b === 0);
-      if (isAdminHyperpMode && !pricePushQueued && (market.config.authorityPriceE6 ?? BigInt(0)) === BigInt(0)) {
-        if (!state.hyperpNoPriceSkipped) {
-          state.hyperpNoPriceSkipped = true;
-          logger.warn("PERC-1254: Skipping admin-hyperp market — no price available and on-chain authority_price_e6=0.", {
-            slabAddress,
-          });
-        }
-        return false;
-      }
-      if (state.hyperpNoPriceSkipped && (pricePushQueued || (market.config.authorityPriceE6 ?? BigInt(0)) > BigInt(0))) {
-        state.hyperpNoPriceSkipped = false;
-        logger.info("PERC-1254: Admin-hyperp market now has a price — resuming cranks", { slabAddress });
-      }
 
       // Crank instruction
       const crankData = encodeKeeperCrank({ callerIdx: 65535 });
@@ -671,10 +618,6 @@ export class CrankService {
       state.consecutiveFailures = 0;
       state.isActive = true;
       if (state.failureCount > 0) state.failureCount = 0;
-
-      if (pricePushQueued) {
-        this.oracleService.recordPushTime(slabAddress);
-      }
 
       eventBus.publish("crank.success", slabAddress, { signature: sig });
       return true;
