@@ -24,7 +24,7 @@ import {
   createLogger,
   sendCriticalAlert,
   sendWarningAlert,
-} from "@percolator/shared";
+} from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
 
 const logger = createLogger("keeper:monitor");

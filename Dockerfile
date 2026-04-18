@@ -11,7 +11,7 @@ COPY package.json pnpm-lock.yaml ./
 
 # SDK is now on npm (@percolatorct/sdk) — no vendor directory needed
 
-# Install all dependencies
+# Install all dependencies (including devDeps for TypeScript compilation)
 RUN pnpm install --frozen-lockfile
 
 # Copy source
@@ -27,12 +27,21 @@ FROM node:22-alpine AS runner
 # Install curl for health checks
 RUN apk add --no-cache curl
 
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@10 --activate
+
 WORKDIR /app
 
-# Copy built artifacts and production dependencies
+# Copy package files for prod-only install
+COPY package.json pnpm-lock.yaml ./
+
+# K-NEW-1: install production deps only — excludes vitest, vite, tsx, @types/*
+# and their associated CVEs from the final image. (pnpm install --prod is deprecated;
+# use --prod flag which maps to --only=prod in pnpm v10)
+RUN pnpm install --frozen-lockfile --prod
+
+# Copy compiled output from builder
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json ./
 
 # Change ownership to node user
 RUN chown -R node:node /app

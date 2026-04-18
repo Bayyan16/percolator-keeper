@@ -12,7 +12,7 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     programId: '11111111111111111111111111111111',
     crankKeypair: 'mock-keypair-path',
@@ -42,7 +42,7 @@ vi.mock('@percolator/shared', () => ({
 }));
 
 import { OracleService } from '../../src/services/oracle.js';
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 
 describe('OracleService', () => {
   let oracleService: OracleService;

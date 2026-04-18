@@ -31,7 +31,7 @@ vi.mock("@percolatorct/sdk", () => ({
   ACCOUNTS_EXECUTE_ADL: {},
 }));
 
-vi.mock("@percolator/shared", () => ({
+vi.mock("@percolatorct/shared", () => ({
   getConnection: vi.fn(() => ({})),
   loadKeypair: vi.fn(() => ({
     publicKey: {
@@ -54,7 +54,7 @@ vi.mock("@percolator/shared", () => ({
 // ─── import (after mocks) ─────────────────────────────────────────────────────
 
 import * as sdk from "@percolatorct/sdk";
-import * as shared from "@percolator/shared";
+import * as shared from "@percolatorct/shared";
 import { AdlService } from "../../src/services/adl.js";
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

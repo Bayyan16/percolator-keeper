@@ -24,7 +24,7 @@ vi.mock('@percolatorct/sdk', () => ({
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     crankIntervalMs: 30000,
     crankInactiveIntervalMs: 120000,
@@ -71,7 +71,7 @@ vi.mock('@percolator/shared', () => ({
 import { PublicKey } from '@solana/web3.js';
 import { CrankService } from '../../src/services/crank.js';
 import * as core from '@percolatorct/sdk';
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 
 describe('CrankService', () => {
   let crankService: CrankService;

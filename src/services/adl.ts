@@ -27,7 +27,7 @@
  *  - @percolator/sdk:  fetchSlab, parseEngine, parseConfig, parseAllAccounts,
  *                      encodeExecuteAdl, ACCOUNTS_EXECUTE_ADL, buildAccountMetas,
  *                      buildIx, derivePythPushOraclePDA
- *  - @percolator/shared: getConnection, loadKeypair, sendWithRetryKeeper,
+ *  - @percolatorct/shared: getConnection, loadKeypair, sendWithRetryKeeper,
  *                        createLogger, sendWarningAlert, sendCriticalAlert
  */
 
@@ -51,7 +51,7 @@ import {
   createLogger,
   sendWarningAlert,
   sendCriticalAlert,
-} from "@percolator/shared";
+} from "@percolatorct/shared";
 import type { MarketCrankState } from "./crank-types.js";
 
 const logger = createLogger("keeper:adl");

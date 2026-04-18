@@ -59,7 +59,7 @@ vi.mock('@percolatorct/sdk', () => ({
   IX_TAG: { TradeNoCpi: 1, TradeCpi: 2 },
 }));
 
-vi.mock('@percolator/shared', () => ({
+vi.mock('@percolatorct/shared', () => ({
   config: {
     crankKeypair: 'mock-keypair-path',
   },
@@ -124,7 +124,7 @@ vi.mock('@percolator/shared', () => ({
 import { PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
 import { LiquidationService } from '../../src/services/liquidation.js';
 import * as core from '@percolatorct/sdk';
-import * as shared from '@percolator/shared';
+import * as shared from '@percolatorct/shared';
 
 // Zero key (all zeros) - used for Pyth-pinned oracleAuthority and Hyperp indexFeedId
 const ZERO_KEY = (() => {

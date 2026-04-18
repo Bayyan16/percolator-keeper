@@ -2,7 +2,7 @@ import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   type MarketConfig,
 } from "@percolatorct/sdk";
-import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolator/shared";
+import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolatorct/shared";
 
 const logger = createLogger("keeper:oracle");
 

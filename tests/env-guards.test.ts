@@ -2,24 +2,30 @@ import { describe, it, expect } from "vitest";
 import { validateKeeperEnvGuards } from "../src/env-guards.js";
 
 describe("validateKeeperEnvGuards", () => {
-  it("throws when SUPABASE_KEY equals SUPABASE_SERVICE_ROLE_KEY", () => {
+  // K-2 (HIGH): SUPABASE_SERVICE_ROLE_KEY must be rejected even when both keys are set.
+  // The hard-reject fires before the equality check.
+  it("throws when SUPABASE_SERVICE_ROLE_KEY is present (any value)", () => {
     const env = {
       SUPABASE_KEY: "same-key",
       SUPABASE_SERVICE_ROLE_KEY: "same-key",
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).toThrow(
-      "Keeper misconfiguration: SUPABASE_KEY must not equal SUPABASE_SERVICE_ROLE_KEY"
+      "SECURITY: SUPABASE_SERVICE_ROLE_KEY must NOT be set in keeper env"
     );
   });
 
-  it("does not throw when keys differ", () => {
+  // K-2: also rejects when the service-role key differs from the anon key —
+  // any non-empty SUPABASE_SERVICE_ROLE_KEY is forbidden regardless of value.
+  it("throws when SUPABASE_SERVICE_ROLE_KEY is set even if different from anon key", () => {
     const env = {
       SUPABASE_KEY: "anon-key",
       SUPABASE_SERVICE_ROLE_KEY: "service-role-key",
     } as NodeJS.ProcessEnv;
 
-    expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    expect(() => validateKeeperEnvGuards(env)).toThrow(
+      "SECURITY: SUPABASE_SERVICE_ROLE_KEY must NOT be set in keeper env"
+    );
   });
 
   it("does not throw when one key is missing", () => {

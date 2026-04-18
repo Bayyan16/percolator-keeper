@@ -16,7 +16,7 @@ import {
   parseDexPool,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, rateLimitedCall, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolator/shared";
+import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 
 const logger = createLogger("keeper:crank");
@@ -439,7 +439,6 @@ export class CrankService {
       // price push needed — the instruction reads Raydium/PumpSwap/Meteora pools.
       if (this.isHyperpOracle(market)) {
         const instructions = [];
-        const SKIP_UPDATE_HYPERP_MARK = false;
 
         // UpdateHyperpMark: accounts = [slab(writable), dex_pool, clock, ...remaining]
         //

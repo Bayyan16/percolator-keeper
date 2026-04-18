@@ -2,6 +2,18 @@ export function validateKeeperEnvGuards(env: NodeJS.ProcessEnv = process.env): v
   const supabaseKey = env.SUPABASE_KEY?.trim();
   const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY?.trim();
 
+  // K-2 (HIGH): hard-reject SUPABASE_SERVICE_ROLE_KEY being present at all.
+  // If the service-role key is set — even without the anon key — keeper would
+  // boot with RLS-bypass capability, violating the principle of least privilege.
+  // Keeper only needs the anon key (SUPABASE_KEY) at runtime. (PERC-8232)
+  if (serviceRoleKey && serviceRoleKey !== "") {
+    throw new Error(
+      "SECURITY: SUPABASE_SERVICE_ROLE_KEY must NOT be set in keeper env. " +
+      "Keeper needs only the anon key (SUPABASE_KEY). " +
+      "Remove SUPABASE_SERVICE_ROLE_KEY from .env and Railway config. (PERC-8232)"
+    );
+  }
+
   if (supabaseKey && serviceRoleKey && supabaseKey === serviceRoleKey) {
     throw new Error(
       "Keeper misconfiguration: SUPABASE_KEY must not equal SUPABASE_SERVICE_ROLE_KEY. " +

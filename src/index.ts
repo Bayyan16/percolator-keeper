@@ -1,7 +1,7 @@
 import "dotenv/config";
 import http from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection, loadKeypair } from "@percolator/shared";
+import { config, createLogger, initSentry, captureException, sendInfoAlert, sendCriticalAlert, sendWarningAlert, createServiceMonitors, getConnection, loadKeypair } from "@percolatorct/shared";
 import { OracleService } from "./services/oracle.js";
 import { CrankService } from "./services/crank.js";
 import { LiquidationService } from "./services/liquidation.js";
@@ -466,7 +466,7 @@ const STARTUP_DISCOVERY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
 async function start() {
   // Validate RPC connectivity before attempting discovery — fail fast on misconfiguration
   try {
-    const { getConnection, getFallbackConnection } = await import("@percolator/shared");
+    const { getConnection, getFallbackConnection } = await import("@percolatorct/shared");
     const primary = getConnection();
     const slot = await primary.getSlot();
     logger.info("Primary RPC connectivity verified", { slot });

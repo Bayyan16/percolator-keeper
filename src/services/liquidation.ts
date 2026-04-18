@@ -1,4 +1,4 @@
-import { PublicKey, SYSVAR_CLOCK_PUBKEY, ComputeBudgetProgram } from "@solana/web3.js";
+import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   fetchSlab,
   parseConfig,
@@ -16,7 +16,7 @@ import {
   derivePythPushOraclePDA,
   type DiscoveredMarket,
 } from "@percolatorct/sdk";
-import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolator/shared";
+import { config, getConnection, loadKeypair, sendWithRetry, sendWithRetryKeeper, pollSignatureStatus, getRecentPriorityFees, checkTransactionSize, eventBus, createLogger, sendWarningAlert, acquireToken, getFallbackConnection, backoffMs, getErrorMessage } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
 
 const logger = createLogger("keeper:liquidation");

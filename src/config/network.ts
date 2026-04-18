@@ -1,6 +1,6 @@
 /**
  * Network helpers for mainnet/devnet detection.
- * The @percolator/shared networkValidation module handles FORCE_MAINNET guards;
+ * The @percolatorct/shared networkValidation module handles FORCE_MAINNET guards;
  * this module provides a simple runtime check for keeper-specific logic.
  */
 
