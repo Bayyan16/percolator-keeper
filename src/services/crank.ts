@@ -1,4 +1,5 @@
 import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
+import type { Connection } from "@solana/web3.js";
 import {
   discoverMarkets,
   encodeKeeperCrank,
@@ -15,6 +16,7 @@ import {
   detectDexType,
   parseDexPool,
   type DiscoveredMarket,
+  type DexType,
 } from "@percolatorct/sdk";
 import { config, getConnection, getFallbackConnection, loadKeypair, sendWithRetryKeeper, eventBus, createLogger, sendCriticalAlert, getSupabase } from "@percolatorct/shared";
 import { OracleService } from "./oracle.js";
@@ -24,6 +26,15 @@ const logger = createLogger("keeper:crank");
 
 /** Timeout for individual RPC calls — prevents indefinite hangs on unresponsive nodes. */
 const RPC_TIMEOUT_MS = 15_000;
+
+const KEEPER_SEND_OPTS = {
+  skipPreflight: true,
+  multiRpcBroadcast: true,
+  // Crank instruction composition is stable; avoid one getLatestBlockhash +
+  // one simulateTransaction RPC per crank. The shared sender falls back to a
+  // 400k CU limit, which is above observed keeper crank usage.
+  simulateForCU: false,
+} as const;
 
 /** Race a promise against a timeout. Rejects with a descriptive error on expiry. */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -75,6 +86,13 @@ interface MarketCrankState {
    * Populated from Supabase markets.dex_pool_address or mainnet-markets.ts config.
    */
   dexPoolAddress?: string;
+  /**
+   * Cached HYPERP DEX pool metadata. Pool owner/vault accounts are static for a
+   * given pool address, so fetching them on every crank just burns RPC quota.
+   */
+  dexPoolResolvedAddress?: string;
+  dexPoolType?: DexType | "unknown";
+  dexPoolRemainingAccounts?: PublicKey[];
 }
 
 /** Process items in batches with delay between batches.
@@ -414,6 +432,104 @@ export class CrankService {
     return !this.isAdminOracle(market) && isZeroFeed;
   }
 
+  private async resolveHyperpPoolRemainingAccounts(
+    connection: Connection,
+    state: MarketCrankState,
+    poolKey: PublicKey,
+    slabAddress: string,
+  ): Promise<PublicKey[]> {
+    const poolAddress = poolKey.toBase58();
+    if (
+      state.dexPoolResolvedAddress === poolAddress &&
+      state.dexPoolRemainingAccounts !== undefined
+    ) {
+      return state.dexPoolRemainingAccounts;
+    }
+
+    state.dexPoolResolvedAddress = undefined;
+    state.dexPoolType = undefined;
+    state.dexPoolRemainingAccounts = undefined;
+
+    let poolAccountInfo: Awaited<ReturnType<Connection["getAccountInfo"]>>;
+    try {
+      poolAccountInfo = await withTimeout(
+        connection.getAccountInfo(poolKey),
+        RPC_TIMEOUT_MS,
+        `getAccountInfo(${poolAddress})`,
+      );
+    } catch (err) {
+      logger.warn("HYPERP: failed to fetch pool account info for vault detection — sending without remaining accounts", {
+        slabAddress,
+        poolAddress,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    }
+
+    if (poolAccountInfo === null) {
+      logger.warn("HYPERP: pool account not found for vault detection — sending without remaining accounts", {
+        slabAddress,
+        poolAddress,
+      });
+      return [];
+    }
+
+    const dexType = detectDexType(poolAccountInfo.owner);
+    const remainingAccounts: PublicKey[] = [];
+
+    if (dexType === "pumpswap") {
+      // parseDexPool reads baseVault (offset 131) and quoteVault (offset 163)
+      const poolData = new Uint8Array(poolAccountInfo.data);
+      const poolInfo = parseDexPool("pumpswap", poolKey, poolData);
+      if (poolInfo.baseVault && poolInfo.quoteVault) {
+        remainingAccounts.push(poolInfo.baseVault, poolInfo.quoteVault);
+      } else {
+        logger.warn("HYPERP: PumpSwap pool missing vault pubkeys in parsed data — caching empty remaining accounts", {
+          slabAddress,
+          poolAddress,
+        });
+      }
+    } else if (dexType === "meteora-dlmm") {
+      // reserve_y (vault_y) is stored at byte offset 184 in the LbPair account
+      const METEORA_DLMM_OFF_RESERVE_Y = 184;
+      const METEORA_DLMM_MIN_LEN = METEORA_DLMM_OFF_RESERVE_Y + 32;
+      if (poolAccountInfo.data.length >= METEORA_DLMM_MIN_LEN) {
+        const reserveY = new PublicKey(
+          poolAccountInfo.data.slice(METEORA_DLMM_OFF_RESERVE_Y, METEORA_DLMM_OFF_RESERVE_Y + 32),
+        );
+        remainingAccounts.push(reserveY);
+      } else {
+        logger.warn("HYPERP: Meteora DLMM pool data too short to read reserve_y — caching empty remaining accounts", {
+          slabAddress,
+          poolAddress,
+          dataLength: poolAccountInfo.data.length,
+          required: METEORA_DLMM_MIN_LEN,
+        });
+      }
+    } else if (dexType === null) {
+      logger.warn("HYPERP: unknown DEX pool owner — caching empty remaining accounts", {
+        slabAddress,
+        poolAddress,
+        owner: poolAccountInfo.owner.toBase58(),
+      });
+    }
+    // Raydium CLMM: no remaining accounts needed — on-chain price is read
+    // directly from the pool's sqrt_price_x64 field without vault lookups.
+
+    state.dexPoolResolvedAddress = poolAddress;
+    state.dexPoolType = dexType ?? "unknown";
+    state.dexPoolRemainingAccounts = remainingAccounts;
+
+    logger.info("HYPERP: cached DEX pool metadata for cranking", {
+      slabAddress,
+      poolAddress,
+      dexType: state.dexPoolType,
+      remainingAccounts: remainingAccounts.length,
+    });
+
+    return remainingAccounts;
+  }
+
   /** Check if a market is due for cranking based on activity */
   private isDue(state: MarketCrankState): boolean {
     const interval = state.isActive ? this.intervalMs : this.inactiveIntervalMs;
@@ -498,60 +614,14 @@ export class CrankService {
             { pubkey: SYSVAR_CLOCK_PUBKEY, isSigner: false, isWritable: false },
           ];
 
-          // Detect DEX pool type and append required remaining accounts:
-          //   PumpSwap:    [3] base_vault, [4] quote_vault  (from pool data at offsets 131, 163)
-          //   Meteora DLMM: [3] vault_y / reserve_y         (from pool data at offset 184)
-          //   Raydium CLMM: no additional accounts needed
-          const poolAccountInfo = await connection.getAccountInfo(poolKey);
-          if (poolAccountInfo !== null) {
-            const dexType = detectDexType(poolAccountInfo.owner);
-            if (dexType === "pumpswap") {
-              // parseDexPool reads baseVault (offset 131) and quoteVault (offset 163)
-              const poolData = new Uint8Array(poolAccountInfo.data);
-              const poolInfo = parseDexPool("pumpswap", poolKey, poolData);
-              if (poolInfo.baseVault && poolInfo.quoteVault) {
-                hyperpKeys.push({ pubkey: poolInfo.baseVault, isSigner: false, isWritable: false });
-                hyperpKeys.push({ pubkey: poolInfo.quoteVault, isSigner: false, isWritable: false });
-                logger.debug("HYPERP: appended PumpSwap vault accounts", {
-                  slabAddress,
-                  baseVault: poolInfo.baseVault.toBase58(),
-                  quoteVault: poolInfo.quoteVault.toBase58(),
-                });
-              } else {
-                logger.warn("HYPERP: PumpSwap pool missing vault pubkeys in parsed data — sending without remaining accounts", {
-                  slabAddress,
-                  poolAddress: poolKey.toBase58(),
-                });
-              }
-            } else if (dexType === "meteora-dlmm") {
-              // reserve_y (vault_y) is stored at byte offset 184 in the LbPair account
-              const METEORA_DLMM_OFF_RESERVE_Y = 184;
-              const METEORA_DLMM_MIN_LEN = METEORA_DLMM_OFF_RESERVE_Y + 32;
-              if (poolAccountInfo.data.length >= METEORA_DLMM_MIN_LEN) {
-                const reserveY = new PublicKey(
-                  poolAccountInfo.data.slice(METEORA_DLMM_OFF_RESERVE_Y, METEORA_DLMM_OFF_RESERVE_Y + 32),
-                );
-                hyperpKeys.push({ pubkey: reserveY, isSigner: false, isWritable: false });
-                logger.debug("HYPERP: appended Meteora DLMM vault_y account", {
-                  slabAddress,
-                  reserveY: reserveY.toBase58(),
-                });
-              } else {
-                logger.warn("HYPERP: Meteora DLMM pool data too short to read reserve_y — sending without remaining accounts", {
-                  slabAddress,
-                  poolAddress: poolKey.toBase58(),
-                  dataLength: poolAccountInfo.data.length,
-                  required: METEORA_DLMM_MIN_LEN,
-                });
-              }
-            }
-            // Raydium CLMM: no remaining accounts needed — on-chain price is read
-            // directly from the pool's sqrt_price_x64 field without vault lookups.
-          } else {
-            logger.warn("HYPERP: could not fetch pool account info for vault detection — sending without remaining accounts", {
-              slabAddress,
-              poolAddress: poolKey.toBase58(),
-            });
+          const remainingAccounts = await this.resolveHyperpPoolRemainingAccounts(
+            connection,
+            state,
+            poolKey,
+            slabAddress,
+          );
+          for (const pubkey of remainingAccounts) {
+            hyperpKeys.push({ pubkey, isSigner: false, isWritable: false });
           }
 
           instructions.push(buildIx({ programId, keys: hyperpKeys, data: hyperpData }));
@@ -573,7 +643,7 @@ export class CrankService {
         recordAttempt();
         let sig: string;
         try {
-          sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+          sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
           const __tip = process.env.USE_HELIUS_SENDER === "true"
             ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
             : 0;
@@ -624,7 +694,7 @@ export class CrankService {
       recordAttempt();
       let sig: string;
       try {
-        sig = await sendWithRetryKeeper(connection, instructions, [keypair]);
+        sig = await sendWithRetryKeeper(connection, instructions, [keypair], 3, KEEPER_SEND_OPTS);
         const __tip = process.env.USE_HELIUS_SENDER === "true"
           ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
           : 0;

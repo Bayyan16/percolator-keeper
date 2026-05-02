@@ -16,10 +16,13 @@ vi.mock('@solana/web3.js', async () => {
 vi.mock('@percolatorct/sdk', () => ({
   discoverMarkets: vi.fn(),
   encodeKeeperCrank: vi.fn(() => Buffer.from([1, 2, 3])),
+  encodeUpdateHyperpMark: vi.fn(() => Buffer.from([7, 8, 9])),
   encodePushOraclePrice: vi.fn(() => Buffer.from([4, 5, 6])),
   buildAccountMetas: vi.fn(() => []),
   buildIx: vi.fn(() => ({})),
   derivePythPushOraclePDA: vi.fn(() => [{ toBase58: () => '11111111111111111111111111111111' }, 0]),
+  detectDexType: vi.fn(() => 'raydium-clmm'),
+  parseDexPool: vi.fn(),
   ACCOUNTS_KEEPER_CRANK: {},
   ACCOUNTS_PUSH_ORACLE_PRICE: {},
 }));
@@ -333,6 +336,53 @@ describe('CrankService', () => {
       const state = crankService.getMarkets().get(slabAddress);
       expect(state?.consecutiveFailures).toBe(10);
       expect(state?.isActive).toBe(false);
+    });
+
+    it('should cache HYPERP Raydium pool metadata and skip per-crank CU simulation', async () => {
+      const slabAddress = '6ka35xxxfLE5GttGNX7ZDZZz3d1VM2spSWSjArMKxe8o';
+      const poolAddress = '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv';
+      const connection = {
+        getAccountInfo: vi.fn(async () => ({
+          owner: new PublicKey('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK'),
+          data: Buffer.alloc(1544),
+        })),
+      };
+      vi.mocked(shared.getConnection).mockReturnValue(connection as any);
+
+      const mockMarket = {
+        slabAddress: new PublicKey(slabAddress),
+        programId: new PublicKey('ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv'),
+        config: {
+          collateralMint: new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'),
+          oracleAuthority: PublicKey.default,
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+          dexPool: new PublicKey(poolAddress),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: new PublicKey('7JVQvrAfzj3aasLxCkoLYX5KQcrb5nEZhUe5Qa8PvV5G') },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
+      vi.mocked(shared.sendWithRetryKeeper).mockResolvedValue('sig-raydium');
+      await crankService.discover();
+
+      expect(await crankService.crankMarket(slabAddress)).toBe(true);
+      expect(await crankService.crankMarket(slabAddress)).toBe(true);
+
+      expect(connection.getAccountInfo).toHaveBeenCalledTimes(1);
+      expect(core.detectDexType).toHaveBeenCalledTimes(1);
+      expect(shared.sendWithRetryKeeper).toHaveBeenCalledTimes(2);
+      expect(shared.sendWithRetryKeeper).toHaveBeenLastCalledWith(
+        connection,
+        expect.any(Array),
+        expect.any(Array),
+        3,
+        expect.objectContaining({
+          skipPreflight: true,
+          multiRpcBroadcast: true,
+          simulateForCU: false,
+        }),
+      );
     });
   });
 
