@@ -1062,7 +1062,13 @@ export class CrankService {
       });
     }
 
-    const MAX_CYCLE_MS = this.intervalMs * 10;
+    // Sender confirmation can legitimately take up to 60s per attempt and the
+    // keeper sender retries up to 3 times. A watchdog tied to the crank interval
+    // was too aggressive for fast intervals (2s -> 20s), force-resetting
+    // _cycling while the previous send was still polling confirmation. That
+    // created overlapping sends and RPC status-poll storms. Keep the watchdog
+    // above the worst normal Sender retry window.
+    const MAX_CYCLE_MS = Math.max(this.intervalMs * 10, 4 * 60_000);
 
     this.timer = setInterval(async () => {
       if (this._cycling) {
