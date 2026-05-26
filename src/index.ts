@@ -11,6 +11,8 @@ import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
 import { assertMainnetProgramId } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
+import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
+import * as metricsServer from "./lib/metrics-server.js";
 import { getRedisClient } from "./lib/redis-client.js";
 import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
@@ -101,6 +103,7 @@ const solBalanceCheckInterval = setInterval(async () => {
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
     const solBalance = lamports / 1e9;
+    walletBalanceSol.set(solBalance);
 
     if (solBalance < SOL_BALANCE_WARN_THRESHOLD) {
       // Rate-limit alerts to once per 5 minutes to avoid Discord spam
@@ -222,6 +225,8 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 // registered zero intervals. The variables it wrote (lastSuccessfulCrankTime,
 // lastOracleUpdateTime) were never read — /health computes most-recent crank
 // time on every request from the live crank state.
+// activeMarketsCount metric is wired below in start() after markets are
+// discovered, then re-set whenever discover runs (via crankService internals).
 
 // Health endpoint
 const startupTime = Date.now();
@@ -591,6 +596,8 @@ async function start() {
     logger.info("No markets found — keeper will idle and retry discovery each cycle. This is normal for fresh mainnet deployments.");
   }
 
+  activeMarketsCount.set(markets.length);
+
   async function startAllServices(): Promise<void> {
     await crankService.start();
     logger.info("Crank service started");
@@ -653,6 +660,11 @@ async function start() {
     });
   });
 
+  // F: Prometheus /metrics endpoint (loopback only — A.8). Default process metrics
+  // are registered separately so a metrics-scrape failure doesn't crash startup.
+  registerDefaultMetrics();
+  metricsServer.start();
+
   // Send startup alert
   await sendInfoAlert("Keeper service started", [
     { name: "Markets Tracked", value: markets.length.toString(), inline: true },
@@ -710,6 +722,10 @@ async function shutdown(signal: string): Promise<void> {
       logger.info("Releasing leader lock");
       await leaderLock.stop();
     }
+
+    // Stop metrics server
+    logger.info("Closing metrics server");
+    await metricsServer.stop();
 
     // Close health server
     logger.info("Closing health server");
