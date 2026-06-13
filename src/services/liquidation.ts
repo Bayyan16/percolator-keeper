@@ -88,6 +88,13 @@ async function fetchSlabWithRetry(
 const PRICE_E6_DIVISOR = 1_000_000n; // Price precision divisor (6 decimals)
 const BPS_MULTIPLIER = 10_000n; // Basis points multiplier (100% = 10000 bps)
 
+// N4: Minimum notional value (in collateral token base units) below which
+// liquidation is skipped — tx cost exceeds the reward for dust positions.
+// Default 0 = no filter (preserve existing behavior). Override via env var.
+const MIN_LIQUIDATION_NOTIONAL = BigInt(
+  process.env.MIN_LIQUIDATION_NOTIONAL ?? "0"
+);
+
 /**
  * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
  * both compute this value; extracting it both unblocks property testing and
@@ -308,6 +315,8 @@ export class LiquidationService {
           // On-chain pnl is only updated during cranks; between cranks it can be stale
           const notional = absBI(account.positionSize) * price / PRICE_E6_DIVISOR;
           if (notional === 0n) continue;
+          // N4: Skip dust positions where liquidation tx cost exceeds reward
+          if (MIN_LIQUIDATION_NOTIONAL > 0n && notional < MIN_LIQUIDATION_NOTIONAL) continue;
 
           // v12.17: entryPrice is always 0n (removed from on-chain struct).
           // Use account.pnl directly — it is always populated and accurate.
