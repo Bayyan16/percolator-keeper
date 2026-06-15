@@ -189,6 +189,24 @@ async function scanV17Portfolios(
   return candidates;
 }
 
+// Oracle-drift guard (main hardening): abort liquidation if the oracle price drifts more than
+// this between scan-time candidacy and pre-submit re-verification.
+// The on-chain Liquidate instruction carries no price bound, so keeper-side
+// drift detection is the only available mitigation.
+// Default 150 bps (1.5%) — wider than typical intra-minute moves on SOL/BTC/ETH
+// but tight enough to cap keeper-wallet exposure on a 60s scan interval.
+// Set to 0 to disable.
+const MAX_LIQUIDATION_DRIFT_BPS = BigInt(
+  parseInt(process.env.LIQUIDATION_MAX_ORACLE_DRIFT_BPS ?? "150", 10),
+);
+
+// N4: Minimum notional value (in collateral token base units) below which
+// liquidation is skipped — tx cost exceeds the reward for dust positions.
+// Default 0 = no filter (preserve existing behavior). Override via env var.
+const MIN_LIQUIDATION_NOTIONAL = BigInt(
+  process.env.MIN_LIQUIDATION_NOTIONAL ?? "0"
+);
+
 /**
  * A.13: pure helper for margin-ratio-in-bps. scanMarket() and liquidate()
  * both compute this value; extracting it both unblocks property testing and
@@ -231,9 +249,36 @@ function detectOracleMode(cfg: { oracleAuthority: PublicKey; indexFeedId: Public
 }
 
 /**
+ * H3: Read the current cluster Unix time from the Solana Clock sysvar.
+ * Using cluster time avoids false-positive staleness verdicts when the
+ * keeper host clock drifts (skew, leap-second, VM pause). Falls back to
+ * Date.now()/1000 on RPC error so a failing RPC doesn't break liquidation.
+ */
+async function fetchClusterUnixTimeSec(connection: import("@solana/web3.js").Connection): Promise<bigint> {
+  try {
+    const info = await connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY);
+    if (info && info.data.length >= 40) {
+      // Clock sysvar layout: slot(u64,8) + epoch_start_timestamp(i64,8) +
+      //   epoch(u64,8) + leader_schedule_epoch(u64,8) + unix_timestamp(i64,8)
+      const buf = Buffer.from(info.data);
+      const ts = buf.readBigInt64LE(32);
+      return ts > 0n ? ts : BigInt(Math.floor(Date.now() / 1000));
+    }
+  } catch (err) {
+    logger.warn("fetchClusterUnixTimeSec: RPC error, falling back to Date.now()", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return BigInt(Math.floor(Date.now() / 1000));
+}
+
+/**
  * Resolve the effective price for a market based on its oracle mode.
  * Both scanMarket and liquidate call this to ensure identical price selection
  * logic, including the staleness fallback for admin-oracle markets.
+ *
+ * nowSec: current cluster Unix timestamp (from fetchClusterUnixTimeSec).
+ * Using cluster time rather than Date.now() avoids false staleness on clock skew.
  *
  * Returns 0n if no valid price is available.
  */
@@ -246,6 +291,7 @@ function resolveMarketPrice(
     authorityTimestamp: bigint;
   },
   mode: OracleMode,
+  nowSec: bigint,
 ): { price: bigint; stale: boolean } {
   if (mode === "pyth-pinned") {
     return { price: cfg.lastEffectivePriceE6, stale: false };
@@ -254,8 +300,7 @@ function resolveMarketPrice(
     return { price: cfg.lastEffectivePriceE6, stale: false };
   }
   // Admin oracle: try authorityPriceE6 with off-chain staleness check
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  const priceAge = cfg.authorityTimestamp > 0n ? now - cfg.authorityTimestamp : now;
+  const priceAge = cfg.authorityTimestamp > 0n ? nowSec - cfg.authorityTimestamp : nowSec;
   const authorityFresh = cfg.authorityPriceE6 > 0n && priceAge <= 60n;
 
   if (authorityFresh) {
@@ -280,6 +325,9 @@ interface LiquidationCandidate {
    * Undefined for legacy v12.x markets (uses slab-based accountIdx).
    */
   v17PortfolioPubkey?: PublicKey;
+  // Oracle price (E6) at candidacy decision time. Used by liquidate() to detect
+  // oracle drift between scan and submit and abort if it exceeds MAX_LIQUIDATION_DRIFT_BPS.
+  scanPriceE6: bigint;
 }
 
 export class LiquidationService {
@@ -289,12 +337,16 @@ export class LiquidationService {
   private liquidationCount = 0;
   private scanCount = 0;
   private lastScanTime = 0;
-  // Overlap guard: prevent concurrent scan cycles from interleaving
-  private _scanning = false;
-  private _scanStartedAt = 0;
-  // BC1: Signature replay protection
-  private recentSignatures = new Map<string, number>(); // signature -> timestamp
-  private readonly signatureTTLMs = 60_000; // 60 seconds
+  // Overlap guard: the in-flight scan promise (null ⇒ no scan running). A new
+  // cycle starts only when this is null — i.e. the previous scan has SETTLED.
+  // We never force-clear it: a JS promise can't be cancelled, so clearing the
+  // guard while a scan is still awaiting its RPCs would only start a second
+  // scan concurrently (duplicate liquidations against the same accounts). A
+  // genuinely hung cycle therefore stops new scans; lastScanTime stops
+  // advancing, which the index.ts stall alert (3min) and /health "down" (5min →
+  // supervisor restart) already act on.
+  private _inFlight: Promise<void> | null = null;
+  private _scanStartedAt = 0; // start of the in-flight scan — for the watchdog WARN log only
   // PERC-134: Exponential backoff on consecutive scan failures
   private consecutiveFailures = 0;
   private readonly maxBackoffMs = 300_000; // 5 minutes max backoff
@@ -309,11 +361,18 @@ export class LiquidationService {
   private readonly _debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly _DEBOUNCE_MS = 1_000;
   private _unsubLoader?: () => void;
-  // B4: per-cycle dedup so the same owner is never targeted twice in the same
-  // scan cycle. A user underwater in multiple markets used to get N parallel
-  // liquidates fired; now we attempt one per cycle and let the next cycle pick
-  // up any residual undercollateralization.
-  private _cycleSeenOwners = new Set<string>();
+  // C1 (post-mainnet-audit): per-cycle dedup keyed on (slabAddress, accountIdx)
+  // — the unique on-chain identifier of a User sub-account in Percolator. The
+  // previous "B4" key was the owner pubkey, which silently dropped liquidations
+  // of every additional sub-account belonging to the same owner; with multiple
+  // sub-accounts per owner being normal usage on a perp DEX, owner-keyed dedup
+  // left residual bad debt for the insurance fund to absorb. We still cap
+  // liquidations per owner per cycle to bound RPC fan-out and preserve
+  // fairness — a single whale with many sub-accounts cannot monopolize the
+  // scan budget. Residual positions above the cap are picked up next cycle.
+  private _cycleSeenPositions = new Set<string>();
+  private _cycleOwnerCounts = new Map<string, number>();
+  private static readonly MAX_LIQ_PER_OWNER_PER_CYCLE = 3;
   // B5: collapse per-liquidation Discord alerts into a single summary alert per
   // market within a 5 s window — prevents cascade-driven channel flooding.
   private readonly _liquidationAlertAggregator = new AlertAggregator(
@@ -389,25 +448,25 @@ export class LiquidationService {
       const candidates: LiquidationCandidate[] = [];
       const maintenanceMarginBps = params.maintenanceMarginBps;
 
+      // H3: Use cluster clock for admin-oracle staleness to avoid false positives
+      // from keeper host clock drift.
+      const connection = getConnection();
+      const nowSec = await fetchClusterUnixTimeSec(connection);
+
       // Determine oracle mode and resolve price via shared helpers
       const oracleMode = detectOracleMode(cfg);
-      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode);
+      const { price: resolvedPrice, stale } = resolveMarketPrice(cfg, oracleMode, nowSec);
 
       let price: bigint;
       if (oracleMode === "pyth-pinned") {
         price = resolvedPrice;
         if (price === 0n) return []; // No price resolved yet
       } else if (oracleMode === "hyperp") {
+        // H3: Use lastEffectivePriceE6 (DEX pool mark price) for Hyperp.
+        // authorityPriceE6 is not the price source for Hyperp mode and is
+        // legitimately 0 when the oracle authority hasn't pushed a price.
         price = resolvedPrice;
         if (price === 0n) return []; // Market not bootstrapped yet
-
-        // Sanity check: mark price should also be non-zero in a healthy Hyperp market
-        if (cfg.authorityPriceE6 === 0n) {
-          if (engine.totalOpenInterest > 0n) {
-            logger.warn("Hyperp market has zero mark price, skipping", { slabAddress });
-          }
-          return [];
-        }
       } else {
         // Admin oracle — resolveMarketPrice handles staleness fallback
         price = resolvedPrice;
@@ -444,6 +503,8 @@ export class LiquidationService {
           // On-chain pnl is only updated during cranks; between cranks it can be stale
           const notional = absBI(account.positionSize) * price / PRICE_E6_DIVISOR;
           if (notional === 0n) continue;
+          // N4: Skip dust positions where liquidation tx cost exceeds reward
+          if (MIN_LIQUIDATION_NOTIONAL > 0n && notional < MIN_LIQUIDATION_NOTIONAL) continue;
 
           // v12.17: entryPrice is always 0n (removed from on-chain struct).
           // Use account.pnl directly — it is always populated and accurate.
@@ -465,10 +526,15 @@ export class LiquidationService {
               pnl: markPnl,
               marginRatio: Number(marginRatioBps) / 100,
               maintenanceMarginBps,
+              scanPriceE6: price,
             });
           }
-        } catch {
-          // Skip accounts that fail to parse
+        } catch (err) {
+          // N6: Log parse failures — a silent skip could hide systematic issues
+          logger.debug("Failed to parse account at index", {
+            slabAddress, accountIndex: i,
+            error: err instanceof Error ? err.message : String(err),
+          });
           continue;
         }
       }
@@ -518,6 +584,7 @@ export class LiquidationService {
     market: DiscoveredMarket,
     accountIdx: number,
     v17PortfolioPubkey?: PublicKey,
+    scanPriceE6: bigint = 0n,
   ): Promise<string | null> {
     const slabAddress = market.slabAddress;
 
@@ -537,7 +604,9 @@ export class LiquidationService {
       // LiquidateAtOracle (tag 7) is removed from the v17 wrapper; the old two-step
       // crank+liquidate is replaced by a single PermissionlessCrank(Liquidate).
 
-      // Determine oracle account
+      // Determine oracle account (v17: single Pyth Push PDA model; no Chainlink in v17).
+      // For v17 markets: admin-oracle (isAllZeros) uses slabAddress as placeholder;
+      // Pyth-pinned markets use the Pyth PriceUpdateV2 PDA derived from the feed hex.
       const feedIdBytes = market.config.indexFeedId.toBytes();
       const feedHex = Array.from(feedIdBytes).map(b => b.toString(16).padStart(2, "0")).join("");
       const isAllZeros = feedHex === "0".repeat(64);
@@ -634,26 +703,66 @@ export class LiquidationService {
 
         // Use the same price source as scanMarket via shared helpers
         // (fixes bug where admin-oracle staleness fallback was missing here)
+        // H3: Use cluster clock for staleness to match scanMarket behavior.
+        const freshNowSec = await fetchClusterUnixTimeSec(connection);
         const freshMode = detectOracleMode(freshCfg);
-        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode);
-        if (freshPrice > 0n) {
-          const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
-          // A.13: shared helper. equity<=0n returns 0n, which is < any
-          // positive maintenanceMarginBps and so correctly proceeds with
-          // liquidation; the previous `if (equity > 0n)` wrapper just
-          // skipped the re-check entirely on underwater equity, missing
-          // the same liquidation case the scanMarket path catches.
-          const freshMarkPnl = freshAccount.pnl;
-          const equity = freshAccount.capital + freshMarkPnl;
-          const marginRatioBps = computeMarginRatioBps(equity, notional);
-          if (
-            notional > 0n &&
-            equity > 0n &&
-            marginRatioBps >= freshParams.maintenanceMarginBps
-          ) {
-            logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
+        const { price: freshPrice } = resolveMarketPrice(freshCfg, freshMode, freshNowSec);
+
+        // H2: fail-safe when no usable price is available. The previous
+        // `if (freshPrice > 0n) { ...recheck... }` envelope silently skipped
+        // the margin recheck whenever resolveMarketPrice returned 0n. That
+        // can happen on a race: scanMarket sees a non-zero price, then by
+        // submit time the admin authority has gone stale and the on-chain
+        // lastEffectivePriceE6 is also 0 (brand-new market never cranked).
+        // The keeper would then proceed to submit a liquidation tx with no
+        // recheck at all. Mirror scanMarket's own posture (which returns []
+        // on price===0n) and refuse to submit.
+        if (freshPrice === 0n) {
+          logger.warn(
+            "Race condition: no fresh price available for pre-submit recheck, aborting",
+            { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), oracleMode: freshMode },
+          );
+          return null;
+        }
+
+        // Oracle-drift guard: the on-chain Liquidate instruction carries no
+        // price bound. If the oracle has moved more than MAX_LIQUIDATION_DRIFT_BPS
+        // since candidacy, the on-chain execution price may differ enough to
+        // flip the liquidation's P&L. Abort rather than absorb that drift.
+        if (MAX_LIQUIDATION_DRIFT_BPS > 0n && scanPriceE6 > 0n && freshPrice > 0n) {
+          const delta = freshPrice > scanPriceE6
+            ? freshPrice - scanPriceE6
+            : scanPriceE6 - freshPrice;
+          const driftBps = delta * BPS_MULTIPLIER / scanPriceE6;
+          if (driftBps > MAX_LIQUIDATION_DRIFT_BPS) {
+            logger.warn("Aborting liquidation: oracle drift exceeds limit", {
+              accountIndex: accountIdx,
+              slabAddress: slabAddress.toBase58(),
+              scanPriceE6: scanPriceE6.toString(),
+              freshPriceE6: freshPrice.toString(),
+              driftBps: driftBps.toString(),
+              limitBps: MAX_LIQUIDATION_DRIFT_BPS.toString(),
+            });
             return null;
           }
+        }
+
+        const notional = absBI(freshAccount.positionSize) * freshPrice / PRICE_E6_DIVISOR;
+        // A.13: shared helper. equity<=0n returns 0n, which is < any
+        // positive maintenanceMarginBps and so correctly proceeds with
+        // liquidation; the previous `if (equity > 0n)` wrapper just
+        // skipped the re-check entirely on underwater equity, missing
+        // the same liquidation case the scanMarket path catches.
+        const freshMarkPnl = freshAccount.pnl;
+        const equity = freshAccount.capital + freshMarkPnl;
+        const marginRatioBps = computeMarginRatioBps(equity, notional);
+        if (
+          notional > 0n &&
+          equity > 0n &&
+          marginRatioBps >= freshParams.maintenanceMarginBps
+        ) {
+          logger.warn("Race condition: account no longer undercollateralized", { accountIndex: accountIdx, slabAddress: slabAddress.toBase58(), marginRatioBps: Number(marginRatioBps) });
+          return null;
         }
       }
       } // end else (v12.x verification path)
@@ -687,16 +796,6 @@ export class LiquidationService {
         recordFailed();
         txSentTotal.inc({ result: "fail", type: "liquidation" });
         throw err;
-      }
-
-      // BC1: Track signature to prevent replay attacks
-      const now = Date.now();
-      this.recentSignatures.set(sig, now);
-      // Clean up signatures older than TTL
-      for (const [oldSig, timestamp] of this.recentSignatures.entries()) {
-        if (now - timestamp > this.signatureTTLMs) {
-          this.recentSignatures.delete(oldSig);
-        }
       }
 
       this.liquidationCount++;
@@ -759,10 +858,11 @@ export class LiquidationService {
     let scanned = 0;
     let candidateCount = 0;
     let liquidated = 0;
-    // B4: fresh per-cycle dedup set — owners targeted in earlier cycles can
-    // be re-targeted next cycle (the previous liquidate may have only chipped
-    // away part of their exposure).
-    this._cycleSeenOwners.clear();
+    // C1: fresh per-cycle dedup state — positions targeted in earlier cycles
+    // can be re-targeted next cycle (a previous liquidate may have only chipped
+    // away part of the exposure; partial-fill retry is intentional).
+    this._cycleSeenPositions.clear();
+    this._cycleOwnerCounts.clear();
 
     // P2 FIX: Periodically clear permanentlySkipped to allow recovery when SDK is updated.
     // Markets re-add themselves on next parse failure, so this is safe.
@@ -807,20 +907,34 @@ export class LiquidationService {
         candidateCount += candidates.length;
 
         // Liquidations are sequential (each is a transaction).
-        // B4: skip owners already targeted earlier in this scan cycle.
+        // C1: dedup per on-chain (slab, accountIdx) position; rate-limit per
+        // owner across the cycle.
         for (const candidate of candidates) {
-          if (this._cycleSeenOwners.has(candidate.owner)) {
-            logger.debug("Skipping owner already targeted this cycle", {
+          const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
+          if (this._cycleSeenPositions.has(positionKey)) {
+            logger.debug("Skipping position already targeted this cycle", {
+              positionKey,
               owner: candidate.owner.slice(0, 8),
-              slabAddress: candidate.slabAddress.slice(0, 8),
             });
             continue;
           }
-          this._cycleSeenOwners.add(candidate.owner);
+          // Main hardening: rate-limit per owner across the cycle (prevents hammering one wallet).
+          const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
+          if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+            logger.debug("Owner hit per-cycle liquidation cap", {
+              owner: candidate.owner.slice(0, 8),
+              cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+            });
+            continue;
+          }
+          this._cycleSeenPositions.add(positionKey);
+          this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
+          // v17: pass portfolioPubkey for DESYNC-3; scanPriceE6 for drift guard (main hardening).
           const sig = await this.liquidate(
             filteredBatch[j]!.market,
             candidate.accountIdx,
             candidate.v17PortfolioPubkey,
+            candidate.scanPriceE6,
           );
           if (sig) liquidated++;
         }
@@ -844,49 +958,65 @@ export class LiquidationService {
 
     const MAX_SCAN_MS = this.intervalMs * 5;
 
-    const runCycle = async () => {
-      if (this._scanning) {
+    const runCycle = (): void => {
+      // Single-flight: never start a second scan while one is in flight. The
+      // watchdog only WARNs on an over-long cycle — it must NOT force-reset the
+      // guard, because clearing it cannot cancel the in-flight RPCs and would
+      // only spawn a concurrent scan. A hung cycle stops new scans; recovery is
+      // driven by the existing stall alert / health-down → restart path.
+      if (this._inFlight) {
         const elapsed = Date.now() - this._scanStartedAt;
         if (elapsed > MAX_SCAN_MS) {
-          logger.error("Liquidation scan watchdog: cycle exceeded max duration, force-resetting", {
+          logger.warn("Liquidation scan still in flight past max duration — not starting a concurrent scan", {
             elapsedMs: elapsed,
             maxScanMs: MAX_SCAN_MS,
           });
-          this._scanning = false;
         }
         return;
       }
-      this._scanning = true;
+
       this._scanStartedAt = Date.now();
-      try {
-        const marketsSnapshot = new Map(getMarkets());
-        const result = await this.scanAndLiquidateAll(marketsSnapshot);
-        this.consecutiveFailures = 0; // Reset on success
-        if (result.candidates > 0) {
-          logger.info("Liquidation scan complete", {
-            scanned: result.scanned,
-            candidates: result.candidates,
-            liquidated: result.liquidated
+      const scan = (async () => {
+        try {
+          const marketsSnapshot = new Map(getMarkets());
+          const result = await this.scanAndLiquidateAll(marketsSnapshot);
+          this.consecutiveFailures = 0; // Reset on success
+          if (result.candidates > 0) {
+            logger.info("Liquidation scan complete", {
+              scanned: result.scanned,
+              candidates: result.candidates,
+              liquidated: result.liquidated,
+            });
+          }
+        } catch (err) {
+          this.consecutiveFailures++;
+          const backoff = Math.min(
+            this.intervalMs * Math.pow(2, this.consecutiveFailures - 1),
+            this.maxBackoffMs,
+          );
+          logger.error("Liquidation cycle failed", {
+            error: err instanceof Error ? err.message : String(err),
+            consecutiveFailures: this.consecutiveFailures,
+            nextRetryMs: Math.round(backoff),
           });
+          // Schedule a delayed retry instead of waiting for the next fixed
+          // interval. Guard on this.timer so a queued retry can't start a scan
+          // after stop(); the single-flight check above prevents overlap if the
+          // regular interval tick also fires.
+          if (backoff > this.intervalMs && this.timer !== null) {
+            setTimeout(() => {
+              if (this.timer !== null) runCycle();
+            }, backoff - this.intervalMs);
+          }
         }
-      } catch (err) {
-        this.consecutiveFailures++;
-        const backoff = Math.min(
-          this.intervalMs * Math.pow(2, this.consecutiveFailures - 1),
-          this.maxBackoffMs,
-        );
-        logger.error("Liquidation cycle failed", {
-          error: err instanceof Error ? err.message : String(err),
-          consecutiveFailures: this.consecutiveFailures,
-          nextRetryMs: Math.round(backoff),
-        });
-        // Schedule delayed retry instead of waiting for next fixed interval
-        if (backoff > this.intervalMs) {
-          setTimeout(runCycle, backoff - this.intervalMs);
-        }
-      } finally {
-        this._scanning = false;
-      }
+      })();
+
+      this._inFlight = scan;
+      // Clear the guard only when THIS scan settles. The identity check makes a
+      // slow cycle unable to clobber a newer cycle's guard.
+      void scan.finally(() => {
+        if (this._inFlight === scan) this._inFlight = null;
+      });
     };
     this.timer = setInterval(runCycle, this.intervalMs);
 
@@ -911,7 +1041,7 @@ export class LiquidationService {
             // Single-market scan — fire-and-forget; errors logged inside scanMarket.
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
-                const sig = await this.liquidate(market.market, c.accountIdx, c.v17PortfolioPubkey);
+                const sig = await this.liquidate(market.market, c.accountIdx, c.v17PortfolioPubkey, c.scanPriceE6);
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
                     slabAddress: slabKey,

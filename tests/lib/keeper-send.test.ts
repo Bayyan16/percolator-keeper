@@ -25,7 +25,7 @@ vi.mock("../../src/lib/cu-estimator.js", () => {
 });
 
 import * as shared from "@percolatorct/shared";
-import { keeperSend } from "../../src/lib/keeper-send.js";
+import { keeperSend, classifySendError } from "../../src/lib/keeper-send.js";
 import { KeeperBudget } from "../../src/lib/budget.js";
 import { Keypair, TransactionInstruction, PublicKey } from "@solana/web3.js";
 
@@ -103,6 +103,37 @@ describe("keeperSend", () => {
     expect(stats.cycleTxCount).toBe(1);
     // failed txs still consume lamports (fees paid on-chain if landed)
     expect(stats.cycleSpend).toBeGreaterThan(0);
+  });
+
+  describe("classifySendError", () => {
+    it("classifies a landed-but-reverted tx as 'reverted'", () => {
+      expect(classifySendError(new Error('Transaction failed: {"InstructionError":[0,{"Custom":1}]}'))).toBe("reverted");
+    });
+
+    it("classifies a confirmation timeout as 'fail' (never landed)", () => {
+      expect(classifySendError(new Error("Transaction 5xZ not confirmed after 60000ms"))).toBe("fail");
+    });
+
+    it("classifies an RPC/send error as 'fail'", () => {
+      expect(classifySendError(new Error("failed to send transaction: 429 Too Many Requests"))).toBe("fail");
+      expect(classifySendError("some non-error value")).toBe("fail");
+    });
+  });
+
+  it("records a reverted tx (excluded from success-rate window) when the send reverts on-chain", async () => {
+    vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(
+      new Error('Transaction failed: {"InstructionError":[0,{"Custom":1}]}'),
+    );
+
+    await expect(
+      keeperSend(connection, [makeDummyIx()], [keypair], "liquidation", budget),
+    ).rejects.toThrow("Transaction failed:");
+
+    const stats = budget.getStats();
+    // Counts as an attempt + spend, but is NOT a success-rate sample.
+    expect(stats.cycleTxCount).toBe(1);
+    expect(stats.cycleSpend).toBeGreaterThan(0);
+    expect(stats.txWindowSize).toBe(0);
   });
 
   it("passes maxRetries to sendWithRetryKeeper", async () => {
@@ -221,5 +252,67 @@ describe("keeperSend", () => {
         expect(shared.sendWithRetryKeeper).not.toHaveBeenCalled();
       },
     );
+  });
+
+  // Reservation-leak guard: canSpend() reserves; recordTx() must release on
+  // EVERY exit path. A leak silently shrinks the effective cap until the budget
+  // wedges, so we assert the pending tally returns to zero after each path.
+  describe("reservation release (no leak)", () => {
+    it("releases the reservation on a successful real send", async () => {
+      await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+      expect(budget.getStats().reservedLamports).toBe(0);
+      expect(budget.getStats().reservedTxCount).toBe(0);
+    });
+
+    it("releases the reservation when the send throws", async () => {
+      vi.mocked(shared.sendWithRetryKeeper).mockRejectedValueOnce(new Error("RPC error"));
+      await expect(
+        keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget),
+      ).rejects.toThrow("RPC error");
+      expect(budget.getStats().reservedLamports).toBe(0);
+      expect(budget.getStats().reservedTxCount).toBe(0);
+    });
+
+    it("releases the reservation on the DRY_RUN path", async () => {
+      process.env.DRY_RUN = "true";
+      try {
+        await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+        expect(budget.getStats().reservedLamports).toBe(0);
+        expect(budget.getStats().reservedTxCount).toBe(0);
+      } finally {
+        delete process.env.DRY_RUN;
+      }
+    });
+
+    it("makes NO reservation when canSpend refuses (returns null)", async () => {
+      budget.haltManually("test");
+      const r = await keeperSend(connection, [makeDummyIx()], [keypair], "crank", budget);
+      expect(r).toBeNull();
+      expect(budget.getStats().reservedLamports).toBe(0);
+      expect(budget.getStats().reservedTxCount).toBe(0);
+    });
+
+    it("does not leak across many interleaved success/throw sends", async () => {
+      const wide = new KeeperBudget({
+        maxSolPerCycle: Number.MAX_SAFE_INTEGER,
+        maxSolPerHour: Number.MAX_SAFE_INTEGER,
+        maxSolPerDay: Number.MAX_SAFE_INTEGER,
+        maxTxPerCycle: 100_000,
+        txSuccessRateThreshold: 0,
+        txSuccessRateMinSamples: 1_000_000,
+      });
+      let i = 0;
+      vi.mocked(shared.sendWithRetryKeeper).mockImplementation(async () => {
+        if (i++ % 2 === 0) throw new Error("flaky");
+        return "sig";
+      });
+      await Promise.allSettled(
+        Array.from({ length: 100 }, () =>
+          keeperSend(connection, [makeDummyIx()], [keypair], "crank", wide),
+        ),
+      );
+      expect(wide.getStats().reservedLamports).toBe(0);
+      expect(wide.getStats().reservedTxCount).toBe(0);
+    });
   });
 });

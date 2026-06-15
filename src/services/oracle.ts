@@ -2,7 +2,8 @@ import { PublicKey, SYSVAR_CLOCK_PUBKEY } from "@solana/web3.js";
 import {
   type MarketConfig,
 } from "@percolatorct/sdk";
-import { eventBus, createLogger, getErrorMessage, sendWarningAlert } from "@percolatorct/shared";
+import { eventBus, createLogger, getErrorMessage, sendWarningAlert, sendCriticalAlert } from "@percolatorct/shared";
+import { isMainnet } from "../config/network.js";
 import { oraclePushCountTotal, oracleStalenessSeconds } from "../lib/metrics.js";
 
 const logger = createLogger("keeper:oracle");
@@ -53,7 +54,6 @@ interface JupiterResponse {
 
 export class OracleService {
   private priceHistory = new Map<string, PriceEntry[]>();
-  private lastPushTime = new Map<string, number>();
   private _nonAuthorityLogged = new Set<string>();
   private readonly rateLimitMs = parseInt(process.env.ORACLE_RATE_LIMIT_MS ?? "5000", 10);
   private readonly maxHistory = 100;
@@ -69,11 +69,62 @@ export class OracleService {
     { consecutive: number; alertSent: boolean }
   >();
   private static readonly SINGLE_SOURCE_ALERT_THRESHOLD = 10;
-  // M-4: Track when an external source (DexScreener or Jupiter) last returned a
-  // valid price for each slab. Used to cap the on-chain fallback duration so that
-  // a prolonged external outage causes the oracle to go stale rather than cycling
-  // the same on-chain price forever.
+  // M6: per-mint dual-null state. Both DexScreener and Jupiter can return null
+  // simultaneously during an outage. Track consecutive observations and escalate
+  // via sendCriticalAlert at threshold so ops sees the outage immediately rather
+  // than waiting for the downstream stale-oracle cron.
+  private _dualNullState = new Map<
+    string,
+    { consecutive: number; alertSent: boolean }
+  >();
+  private static readonly DUAL_NULL_ALERT_THRESHOLD = 5;
+  // Track when an external source (DexScreener or Jupiter) last returned a valid
+  // price for each slab. This is the single freshness signal read by
+  // getStaleMarkets(): a prolonged external outage (only cached/on-chain fallback
+  // prices, which never advance this clock) causes the market to age into
+  // staleness rather than cranking on a frozen price forever.
   private lastExternalPriceMs = new Map<string, number>();
+  // H1: Track consecutive deviation rejections per slab to avoid permanent anchor lock.
+  // After DEVIATION_ACCEPT_AFTER consecutive rejections, accept the price as legitimate.
+  private deviationRejections = new Map<string, number>();
+  private static readonly DEVIATION_ACCEPT_AFTER = 5;
+
+  /** Injectable clock — defaults to Date.now() in production; overridden in
+   *  tests so price freshness / staleness is deterministic without faking the
+   *  global Date around the async fetch path. */
+  private readonly now: () => number;
+
+  constructor(opts?: { now?: () => number }) {
+    this.now = opts?.now ?? (() => Date.now());
+    // M5: DexScreener and Jupiter REST APIs return prices with NO publisher
+    // signature and NO slot field. Cross-source validation (10% deviation) +
+    // min-liquidity filter ($1000) + historical deviation cap (30%) mitigate
+    // single-source manipulation, but if both sources are simultaneously
+    // attacker-influenced (DNS poisoning, CDN compromise, MITM on a non-pinned
+    // TLS chain), the keeper has no cryptographic recourse. Migrating to
+    // Pyth Pull (signed on-chain) is the actual fix; this warn makes the
+    // architectural debt explicit at boot so it is not silently inherited.
+    //
+    // To silence after operator acknowledgement, set
+    // ORACLE_ACK_UNSIGNED_SOURCES=true. The keeper still emits a single info
+    // log on boot so the acknowledgement remains audit-traceable in deploy logs.
+    if (isMainnet()) {
+      const ack = process.env.ORACLE_ACK_UNSIGNED_SOURCES === "true";
+      if (ack) {
+        logger.info(
+          "OracleService: mainnet running with unsigned price sources (DexScreener/Jupiter) — operator acknowledgement received (ORACLE_ACK_UNSIGNED_SOURCES=true)",
+        );
+      } else {
+        logger.warn(
+          "OracleService: mainnet running with unsigned price sources (DexScreener/Jupiter). " +
+            "These APIs have no publisher signature and no slot anchor. Cross-source validation, " +
+            "min-liquidity ($1000), and historical deviation (30%) are partial mitigations only. " +
+            "Migrate to Pyth Pull for cryptographic guarantees. Set ORACLE_ACK_UNSIGNED_SOURCES=true " +
+            "to acknowledge this risk and silence this warn.",
+        );
+      }
+    }
+  }
 
   /** Fetch price from DexScreener (with rate-limit cache) */
   async fetchDexScreenerPrice(mint: string): Promise<bigint | null> {
@@ -130,18 +181,9 @@ export class OracleService {
       if (!res.ok) return null;
       
       const json = (await res.json()) as DexScreenerResponse;
-      // BH7: Use captured timestamp for atomicity.
-      // Delete before set so refreshed entries move to the end of Map
-      // iteration order — ensures eviction targets the least-recently-used
-      // entry, not a frequently-refreshed one stuck at its insertion position.
-      dexScreenerCache.delete(mint);
-      dexScreenerCache.set(mint, { data: json, fetchedAt: now });
-      // Evict oldest entry when cache exceeds size cap
-      if (dexScreenerCache.size > DEX_SCREENER_CACHE_MAX_SIZE) {
-        const oldestKey = dexScreenerCache.keys().next().value;
-        if (oldestKey !== undefined) dexScreenerCache.delete(oldestKey);
-      }
 
+      // M7: Validate BEFORE caching — don't cache bad responses that would
+      // suppress fresh fetches for the full TTL window.
       const pair = sortPairsByLiquidity(json.pairs)?.[0];
       if (!pair?.priceUsd) return null;
       if ((pair.liquidity?.usd ?? 0) < MIN_LIQUIDITY_USD) return null;
@@ -150,6 +192,18 @@ export class OracleService {
       // B8: see cache-hit branch above.
       const priceE6 = BigInt(Math.round(parsed * PRICE_E6_MULTIPLIER));
       if (priceE6 === 0n) return null;
+
+      // Only cache validated responses with a usable price.
+      // BH7: Delete before set so refreshed entries move to the end of Map
+      // iteration order — ensures eviction targets the least-recently-used
+      // entry, not a frequently-refreshed one stuck at its insertion position.
+      dexScreenerCache.delete(mint);
+      dexScreenerCache.set(mint, { data: json, fetchedAt: now });
+      if (dexScreenerCache.size > DEX_SCREENER_CACHE_MAX_SIZE) {
+        const oldestKey = dexScreenerCache.keys().next().value;
+        if (oldestKey !== undefined) dexScreenerCache.delete(oldestKey);
+      }
+
       return priceE6;
     } catch (err) {
       // B9: log instead of silently swallowing — a sustained DexScreener outage
@@ -221,6 +275,18 @@ export class OracleService {
    *   3. Use the higher-confidence source (DexScreener preferred, Jupiter fallback)
    *   4. If both fail, use cached price (reject if stale >60s)
    *   5. Historical deviation check (reject if >30% change from last known price)
+   *
+   * M5 (LOW, architectural): both DexScreener and Jupiter REST APIs return
+   * prices with NO publisher signature and NO slot anchor — the keeper has
+   * no cryptographic proof the price is real, only the TLS chain back to the
+   * provider's CDN. The mitigations above (cross-source 10%, historical 30%,
+   * min-liquidity $1000) catch single-source single-tick manipulation, but a
+   * coordinated attack that controls BOTH sources (e.g. supply-chain
+   * compromise of a shared CDN, or both endpoints under the same TLS root)
+   * would slip through. The real fix is Pyth Pull (on-chain signed prices);
+   * see the boot warn in this service's constructor. Until then, treat
+   * `source: "dexscreener" | "jupiter"` returns as "best-effort price, not
+   * provably the on-chain reality."
    */
   async fetchPrice(mint: string, slabAddress: string): Promise<PriceEntry | null> {
     // Fetch both sources in parallel for cross-validation
@@ -298,14 +364,53 @@ export class OracleService {
     }
 
     if (priceE6 === null) {
+      // M6: dual-source outage. Both DexScreener and Jupiter returned null.
+      // Track consecutive observations so a sustained outage escalates to
+      // sendCriticalAlert rather than degrading silently into the cached
+      // path (or null) cycle after cycle.
+      const dualState = this._dualNullState.get(mint) ?? {
+        consecutive: 0,
+        alertSent: false,
+      };
+      dualState.consecutive++;
+
       const history = this.priceHistory.get(slabAddress);
+      const hasFreshCache =
+        history !== undefined &&
+        history.length > 0 &&
+        this.now() - history[history.length - 1].timestamp <= CACHED_PRICE_MAX_AGE_MS;
+
+      // Critical alert: dual-null AND we cannot fall back to a fresh cache.
+      // The keeper has no usable price for this mint, period. Fire ONCE per
+      // outage and rearm on any successful fetch in the success path below.
+      if (
+        !hasFreshCache &&
+        dualState.consecutive >= OracleService.DUAL_NULL_ALERT_THRESHOLD &&
+        !dualState.alertSent
+      ) {
+        dualState.alertSent = true;
+        logger.error("Oracle dual-source outage: no usable price for mint", {
+          mint,
+          slabAddress,
+          consecutive: dualState.consecutive,
+          threshold: OracleService.DUAL_NULL_ALERT_THRESHOLD,
+        });
+        sendCriticalAlert("Oracle dual-source outage", [
+          { name: "Mint", value: mint.slice(0, 12), inline: true },
+          { name: "Slab", value: slabAddress.slice(0, 12), inline: true },
+          { name: "Consecutive", value: String(dualState.consecutive), inline: true },
+          { name: "Sources Down", value: "DexScreener + Jupiter", inline: false },
+        ])?.catch(() => {});
+      }
+      this._dualNullState.set(mint, dualState);
+
       if (history && history.length > 0) {
         const last = history[history.length - 1];
         // Reject stale cached prices (>60s) to prevent bad liquidations
-        if (Date.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
+        if (this.now() - last.timestamp > CACHED_PRICE_MAX_AGE_MS) {
           logger.warn("Cached price is stale", {
             mint,
-            ageSeconds: Math.round((Date.now() - last.timestamp) / 1000),
+            ageSeconds: Math.round((this.now() - last.timestamp) / 1000),
             maxAgeSeconds: CACHED_PRICE_MAX_AGE_MS / 1000
           });
           return null;
@@ -315,7 +420,25 @@ export class OracleService {
       return null;
     }
 
+    // M6: at least one source succeeded — reset dual-null state for this mint.
+    {
+      const dualState = this._dualNullState.get(mint);
+      if (dualState && (dualState.consecutive > 0 || dualState.alertSent)) {
+        logger.info("Oracle dual-source outage recovered", {
+          mint,
+          previousConsecutive: dualState.consecutive,
+        });
+        dualState.consecutive = 0;
+        dualState.alertSent = false;
+        this._dualNullState.set(mint, dualState);
+      }
+    }
+
     // R2-S4: Historical deviation check — reject if >30% change from last known price
+    // H1: After DEVIATION_ACCEPT_AFTER consecutive rejections for the same market,
+    // accept the price as a legitimate move. Cross-validation (DexScreener + Jupiter
+    // within 10%) already guards against bad data, so consecutive cross-validated
+    // prices at the new level are almost certainly legitimate.
     const HISTORICAL_DEVIATION_MAX_BPS = 3000; // 30.00%
     const history = this.priceHistory.get(slabAddress);
     if (history && history.length > 0) {
@@ -325,24 +448,41 @@ export class OracleService {
           ? Number((priceE6 - lastPrice) * 10_000n / lastPrice)
           : Number((lastPrice - priceE6) * 10_000n / lastPrice);
         if (deviationBps > HISTORICAL_DEVIATION_MAX_BPS) {
-          logger.warn("Price deviation exceeds threshold", {
+          const consecutiveCount = (this.deviationRejections.get(slabAddress) ?? 0) + 1;
+          this.deviationRejections.set(slabAddress, consecutiveCount);
+          if (consecutiveCount < OracleService.DEVIATION_ACCEPT_AFTER) {
+            logger.warn("Price deviation exceeds threshold", {
+              mint,
+              deviationBps,
+              thresholdBps: HISTORICAL_DEVIATION_MAX_BPS,
+              lastPrice: lastPrice.toString(),
+              newPrice: priceE6.toString(),
+              source,
+              consecutiveRejections: consecutiveCount,
+              acceptAfter: OracleService.DEVIATION_ACCEPT_AFTER,
+            });
+            return null;
+          }
+          logger.warn("Accepting deviated price after consecutive rejections (H1)", {
             mint,
             deviationBps,
-            thresholdBps: HISTORICAL_DEVIATION_MAX_BPS,
+            consecutiveRejections: consecutiveCount,
             lastPrice: lastPrice.toString(),
             newPrice: priceE6.toString(),
-            source
+            source,
           });
-          return null;
         }
       }
     }
+    // H1: Price accepted — reset consecutive rejection counter
+    this.deviationRejections.delete(slabAddress);
 
-    const entry: PriceEntry = { priceE6, source, timestamp: Date.now() };
+    const entry: PriceEntry = { priceE6, source, timestamp: this.now() };
     this.recordPrice(slabAddress, entry);
     oraclePushCountTotal.inc({ mint, source });
-    // M-4: Record that an external source produced a valid price. This resets the
-    // fallback clock so the on-chain fallback cap counts from the last real fetch.
+    // Single freshness signal for getStaleMarkets(): record that an external
+    // source produced a valid price now. Cached/fallback returns above bail out
+    // before this line, so they never refresh the staleness clock.
     this.lastExternalPriceMs.set(slabAddress, entry.timestamp);
     return entry;
   }
@@ -369,7 +509,12 @@ export class OracleService {
           oldestKey = key;
         }
       }
-      if (oldestKey) this.priceHistory.delete(oldestKey);
+      if (oldestKey) {
+        this.priceHistory.delete(oldestKey);
+        // Keep lastExternalPriceMs lifetime identical to priceHistory so the
+        // freshness map can't leak entries for markets we no longer track.
+        this.lastExternalPriceMs.delete(oldestKey);
+      }
     }
   }
 
@@ -386,27 +531,21 @@ export class OracleService {
   }
 
   /**
-   * Returns slab addresses where the last successful price push
-   * was more than `thresholdMs` ago (or never pushed).
+   * Returns slab addresses whose last successful EXTERNAL price fetch was more
+   * than `thresholdMs` ago (or which have never had one). Freshness is sourced
+   * exclusively from lastExternalPriceMs, set in fetchPrice() on — and only on —
+   * a successful external fetch, so a market surviving on a cached/on-chain
+   * fallback price never advances the clock and correctly ages into staleness.
+   * This is the single source of truth; there is no separate push-time to drift.
    * Only considers markets that have at least one price history entry.
    */
-  /**
-   * Record a successful price push for a market. Called by CrankService when
-   * a price push is bundled into a crank transaction (bypassing pushPrice()).
-   * Without this, getStaleMarkets() would flag bundled-push markets as stale
-   * because lastPushTime is never updated.
-   */
-  recordPushTime(slabAddress: string): void {
-    this.lastPushTime.set(slabAddress, Date.now());
-  }
-
   getStaleMarkets(thresholdMs: number): string[] {
-    const now = Date.now();
+    const now = this.now();
     const stale: string[] = [];
     for (const [slabAddress] of this.priceHistory) {
-      const lastPush = this.lastPushTime.get(slabAddress) ?? 0;
-      const stalenessMs = lastPush === 0 ? Infinity : now - lastPush;
-      if (lastPush === 0 || stalenessMs > thresholdMs) {
+      const lastFresh = this.lastExternalPriceMs.get(slabAddress) ?? 0;
+      const stalenessMs = lastFresh === 0 ? Infinity : now - lastFresh;
+      if (stalenessMs > thresholdMs) {
         stale.push(slabAddress);
       }
       if (isFinite(stalenessMs)) {

@@ -1,15 +1,33 @@
 import { randomUUID } from "node:crypto";
 import type { Connection, TransactionInstruction, Keypair } from "@solana/web3.js";
-import { sendWithRetryKeeper, createLogger } from "@percolatorct/shared";
+import { sendWithRetryKeeper, createLogger, sendCriticalAlert } from "@percolatorct/shared";
 import type { KeeperSendOptions } from "@percolatorct/shared";
 import { KeeperBudget } from "./budget.js";
+import { budgetHalted } from "./metrics.js";
 import type { TxType, TxResult } from "./budget.js";
 import { HeliusPriorityFeeEstimator } from "./priority-fee.js";
 import type { PriorityFeeEstimator, PriorityFeeTier } from "./priority-fee.js";
 import { CuEstimator } from "./cu-estimator.js";
 import { sharedDecisionLog } from "./decision-log.js";
+import { isMainnetNetwork } from "../network.js";
 
 const logger = createLogger("keeper:send");
+
+// Single-writer guard. In HA mode the keeper must only land on-chain txs while it
+// holds leadership; the on-chain programs are permissionless, so this host-local
+// gate is the actual barrier against a demoted node double-sending. Wired from
+// index.ts to read the live LeaderLock role. Defaults to always-leader so the
+// standalone (no-HA) path is unchanged.
+let _isLeader: () => boolean = () => true;
+
+/**
+ * Wire the leadership check into keeperSend. Call once at startup with a
+ * function that returns true iff this node currently holds the HA leader lock
+ * (or always-true for standalone/no-HA deployments).
+ */
+export function setLeaderCheck(fn: () => boolean): void {
+  _isLeader = fn;
+}
 
 export const BASE_FEE_LAMPORTS = 5_000;
 
@@ -49,11 +67,43 @@ function getCuEstimator(): CuEstimator {
   return _cuEstimator;
 }
 
-export const sharedBudget = new KeeperBudget();
+/**
+ * Process-wide budget circuit breaker. Wired with observability so a halt is
+ * never silent: onHalt sets the keeper_budget_halted gauge and pages on-call;
+ * onResume clears the gauge. Recovery from a latched halt is via the
+ * authenticated POST /admin/budget/resume endpoint (see index.ts).
+ */
+export const sharedBudget = new KeeperBudget(
+  {},
+  {
+    onHalt: (kind, reason) => {
+      budgetHalted.set(1);
+      logger.error("KeeperBudget circuit-breaker halted — refusing all sends until resume", {
+        kind,
+        reason,
+      });
+      // Page on-call. The budget wraps this hook in try/catch, so an alerting
+      // failure can never break the send path. Promise.resolve guards against
+      // a non-thenable return.
+      Promise.resolve(
+        sendCriticalAlert("Keeper budget circuit-breaker tripped — sends halted", [
+          { name: "Kind", value: kind, inline: true },
+          { name: "Reason", value: reason.slice(0, 200), inline: false },
+          {
+            name: "Recovery",
+            value: "Investigate the cause, then POST /admin/budget/resume (x-shared-secret).",
+            inline: false,
+          },
+        ]),
+      ).catch(() => {});
+    },
+    onResume: () => budgetHalted.set(0),
+  },
+);
 
 function isMainnetSender(): boolean {
   return (
-    process.env.NETWORK === "mainnet" &&
+    isMainnetNetwork(process.env.NETWORK) &&
     process.env.USE_HELIUS_SENDER === "true"
   );
 }
@@ -97,6 +147,28 @@ export interface KeeperSendResult {
 }
 
 /**
+ * Classify a send failure for budget accounting.
+ *
+ * `pollSignatureStatus` (in @percolatorct/shared) is the only source that throws
+ * AFTER the tx confirmed on-chain: on `status.err` it throws
+ * `Transaction failed: <err json>`. So that prefix is a reliable "the tx LANDED
+ * and the program reverted" marker. Every other keeper-path throw — confirmation
+ * timeout ("... not confirmed after ...ms"), broadcast rejection, RPC/429,
+ * blockhash, signing, oversize — means the tx did NOT land.
+ *
+ * A landed-but-reverted tx proves the send path works, so it is recorded as
+ * "reverted" (counts as spend + attempt, but excluded from the success-rate
+ * breaker — see KeeperBudget.recordTx). This stops an attacker who dodges
+ * liquidations, or one reverting market, from halting the whole keeper. Anything
+ * we cannot positively identify as a revert defaults to "fail" — the safe
+ * direction, since it keeps feeding the systemic "are we landing?" guard.
+ */
+export function classifySendError(err: unknown): TxResult {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.startsWith("Transaction failed:") ? "reverted" : "fail";
+}
+
+/**
  * Send a keeper transaction with budget gate, priority-fee estimation, and CU simulation.
  *
  * Returns null if the budget is exhausted (budget.canSpend returned false) — caller
@@ -111,6 +183,15 @@ export async function keeperSend(
   maxRetries = 3,
   keeperOpts?: KeeperSendOptions,
 ): Promise<KeeperSendResult | null> {
+  // Single-writer guard: abort before any RPC if this node has lost leadership.
+  // The guard is checked here — before estimateCost, sendWithRetry, or any
+  // external call — so a demoted node cannot land transactions it queued while
+  // still leader but only now processes.
+  if (!_isLeader()) {
+    logger.warn("keeperSend: not leader — skipping send", { txType });
+    return null;
+  }
+
   const { estimatedCost, simulatedCu } = await estimateCost(connection, instructions, signers, txType);
 
   if (!budget.canSpend(estimatedCost, txType)) {
@@ -119,80 +200,165 @@ export async function keeperSend(
       estimatedCost,
       stats: budget.getStats(),
     });
-    return null;
+    return null; // canSpend returned false → no reservation was taken
   }
 
-  // A.10 (HIGH): DRY_RUN intercepts before the real send. The shadow-keeper
-  // harness compares would-have-fired decisions against the live keeper's
-  // tx history; that comparison needs the full ix payload + accounts +
-  // estimated cost recorded against the same budget so runaway-fire is also
-  // detectable in dry runs. Logged at info so the harness can ingest it.
-  if (process.env.DRY_RUN === "true") {
-    const signature = `dry_run_${randomUUID()}`;
-    const accountKeys = instructions.flatMap((ix) =>
-      ix.keys.map((k) => k.pubkey.toBase58()),
-    );
-    logger.info("DRY_RUN: intercepted send", {
-      txType,
-      signature,
-      estimatedCost,
-      simulatedCu,
-      instructions: instructions.map((ix) => ({
-        programId: ix.programId.toBase58(),
-        accountKeys: ix.keys.map((k) => ({
-          pubkey: k.pubkey.toBase58(),
-          isSigner: k.isSigner,
-          isWritable: k.isWritable,
-        })),
-        dataBase64: Buffer.from(ix.data).toString("base64"),
-      })),
-      uniqueAccounts: Array.from(new Set(accountKeys)),
-    });
-
-    // When the shadow harness is enabled, log the decision for the comparison
-    // loop. Errors are swallowed inside DecisionLog.append() — they must never
-    // propagate here. When SHADOW_HARNESS_ENABLED is false, this branch still
-    // runs but the append is still called; the decisionLog.append itself is a
-    // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
-    // inside append() rather than here to keep this path readable.
-    if (process.env.SHADOW_HARNESS_ENABLED === "true") {
-      const firstIx = instructions[0];
-      // The market is the first non-system account from the first instruction.
-      // For crank/liquidation/adl ixs the slab address is always at index 0.
-      const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
-      const instructionData =
-        firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
-      void sharedDecisionLog.append({
-        timestamp: new Date().toISOString(),
-        txType,
-        market,
-        accounts: Array.from(new Set(accountKeys)),
-        instructionData,
-        estimatedCost,
-        reasonChain: [],
-      });
-    }
-
-    budget.recordTx(estimatedCost, txType, "success");
-    return { signature, estimatedCost, simulatedCu };
-  }
-
-  const opts: KeeperSendOptions = {
-    ...keeperOpts,
-    // Saves ~20-50ms on mainnet when Helius Sender runs its own preflight downstream.
-    ...(isMainnetSender() ? { skipPreflight: true } : {}),
+  // canSpend() reserved `estimatedCost` (and one tx slot). We MUST release it
+  // with exactly one recordTx() on every exit path — a reservation that is
+  // never released leaks, silently shrinking the budget's effective cap until
+  // it wedges (worse than the TOCTOU it fixes). The idempotent `release` plus
+  // the outer try/finally guarantee the reservation is freed exactly once even
+  // on an unexpected throw between here and the send.
+  let recorded = false;
+  const release = (result: TxResult): void => {
+    if (recorded) return;
+    recorded = true;
+    budget.recordTx(estimatedCost, txType, result);
   };
 
-  let result: TxResult = "fail";
-  let signature = "";
   try {
-    signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
-    result = "success";
-    return { signature, estimatedCost, simulatedCu };
-  } catch (err) {
-    result = "fail";
-    throw err;
+    // A.10 (HIGH): DRY_RUN intercepts before the real send. The shadow-keeper
+    // harness compares would-have-fired decisions against the live keeper's
+    // tx history; that comparison needs the full ix payload + accounts +
+    // estimated cost recorded against the same budget so runaway-fire is also
+    // detectable in dry runs. Logged at info so the harness can ingest it.
+    if (process.env.DRY_RUN === "true") {
+      const signature = `dry_run_${randomUUID()}`;
+      const accountKeys = instructions.flatMap((ix) =>
+        ix.keys.map((k) => k.pubkey.toBase58()),
+      );
+      logger.info("DRY_RUN: intercepted send", {
+        txType,
+        signature,
+        estimatedCost,
+        simulatedCu,
+        instructions: instructions.map((ix) => ({
+          programId: ix.programId.toBase58(),
+          accountKeys: ix.keys.map((k) => ({
+            pubkey: k.pubkey.toBase58(),
+            isSigner: k.isSigner,
+            isWritable: k.isWritable,
+          })),
+          dataBase64: Buffer.from(ix.data).toString("base64"),
+        })),
+        uniqueAccounts: Array.from(new Set(accountKeys)),
+      });
+
+      // When the shadow harness is enabled, log the decision for the comparison
+      // loop. Errors are swallowed inside DecisionLog.append() — they must never
+      // propagate here. When SHADOW_HARNESS_ENABLED is false, this branch still
+      // runs but the append is still called; the decisionLog.append itself is a
+      // no-op overhead of <1ms. If that ever becomes a concern, add the env guard
+      // inside append() rather than here to keep this path readable.
+      if (process.env.SHADOW_HARNESS_ENABLED === "true") {
+        const firstIx = instructions[0];
+        // The market is the first non-system account from the first instruction.
+        // For crank/liquidation/adl ixs the slab address is always at index 0.
+        const market = firstIx?.keys[0]?.pubkey.toBase58() ?? "unknown";
+        const instructionData =
+          firstIx !== undefined ? Buffer.from(firstIx.data).toString("base64") : "";
+        void sharedDecisionLog.append({
+          timestamp: new Date().toISOString(),
+          txType,
+          market,
+          accounts: Array.from(new Set(accountKeys)),
+          instructionData,
+          estimatedCost,
+          reasonChain: [],
+        });
+      }
+
+      release("success");
+      return { signature, estimatedCost, simulatedCu };
+    }
+
+    const opts: KeeperSendOptions = {
+      ...keeperOpts,
+      // Saves ~20-50ms on mainnet when Helius Sender runs its own preflight downstream.
+      ...(isMainnetSender() ? { skipPreflight: true } : {}),
+    };
+
+    try {
+      const signature = await sendWithRetryKeeper(connection, instructions, signers, maxRetries, opts);
+      // M12: after the tx confirms, fetch the actual on-chain cost and
+      // reconcile the budget. estimatedCost is what the gate checked, but
+      // the realized cost (meta.fee) differs because the actual priority fee
+      // depends on CU consumed × microLamports, and the keeper may have
+      // under- or over-estimated the CU. Fire-and-forget so the send return
+      // is not blocked. Errors are caught internally so a flaky getTransaction
+      // never propagates here.
+      void scheduleRealizedCostReconciliation(connection, signature, estimatedCost, txType, budget);
+      release("success");
+      return { signature, estimatedCost, simulatedCu };
+    } catch (err) {
+      // A landed-but-reverted tx ("Transaction failed: ...") is recorded as
+      // "reverted" so it doesn't poison the success-rate breaker; genuine
+      // never-landed failures stay "fail". The error is rethrown unchanged.
+      release(classifySendError(err));
+      throw err;
+    }
   } finally {
-    budget.recordTx(estimatedCost, txType, result);
+    // Safety net: if a path above reserved but never recorded (an unexpected
+    // throw before release ran), free the reservation as a drop — no spend is
+    // booked because nothing reached the chain. No-op if already released.
+    release("drop");
   }
+}
+
+/**
+ * M12: schedule an async fetch of the tx receipt + budget reconciliation.
+ *
+ * Sampling: env-configurable via KEEPER_REALIZED_COST_SAMPLE_PCT (default 100
+ * = reconcile every tx). Lower values reduce RPC load on busy keepers at the
+ * cost of less accurate drift telemetry. Set to 0 to disable.
+ *
+ * Errors are swallowed — reconciliation is best-effort observability.
+ */
+function scheduleRealizedCostReconciliation(
+  connection: Connection,
+  signature: string,
+  estimatedCost: number,
+  txType: TxType,
+  budget: KeeperBudget,
+): void {
+  const samplePct = parseInt(process.env.KEEPER_REALIZED_COST_SAMPLE_PCT ?? "100", 10);
+  if (!Number.isFinite(samplePct) || samplePct <= 0) return;
+  // Deterministic sampling on signature so the same tx isn't double-sampled
+  // by a future caller — and so tests can pin behaviour with a known sig.
+  const sigHashByte = signature.charCodeAt(0) || 0;
+  if (samplePct < 100 && (sigHashByte % 100) >= samplePct) return;
+
+  // We deliberately don't await this — the send return must not block on
+  // getTransaction. Promise rejections are swallowed inside the body.
+  void (async () => {
+    try {
+      // Helius confirmed slot lag is usually < 2s; give it 5s before fetching.
+      await new Promise((r) => setTimeout(r, 5_000));
+      const tx = await connection.getTransaction(signature, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      const realizedFee = tx?.meta?.fee;
+      if (typeof realizedFee !== "number" || !Number.isFinite(realizedFee) || realizedFee < 0) {
+        return;
+      }
+      // getTransaction's meta.fee is base + priority fee, but it does NOT
+      // include the Jito tip (which is a separate transfer). When the
+      // sender used Helius Sender with a jito tip, add it so realized total
+      // is comparable to estimatedCost (which includes the tip too).
+      const jitoTip = process.env.USE_HELIUS_SENDER === "true"
+        ? parseInt(process.env.JITO_TIP_LAMPORTS ?? "200000", 10)
+        : 0;
+      const realizedTotal = realizedFee + (Number.isFinite(jitoTip) ? jitoTip : 0);
+      budget.adjustForRealizedCost(estimatedCost, realizedTotal, txType);
+    } catch (err) {
+      // Best-effort only. A failed reconciliation just means the drift
+      // metric won't update for this tx — the budget gate already passed
+      // and the recorded estimatedCost is conservative.
+      logger.debug("realized-cost reconciliation failed", {
+        signature: signature.slice(0, 12),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
 }

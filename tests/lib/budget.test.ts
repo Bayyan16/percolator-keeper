@@ -32,6 +32,7 @@ describe("KeeperBudget — defaults", () => {
     expect(stats.config.maxSolPerHour).toBe(500_000_000);
     expect(stats.config.maxSolPerDay).toBe(3_000_000_000);
     expect(stats.config.maxTxPerCycle).toBe(60);
+    expect(stats.config.cycleWindowMs).toBe(30_000);
     expect(stats.config.txSuccessRateThreshold).toBe(0.7);
     expect(stats.halted).toBe(false);
   });
@@ -164,6 +165,93 @@ describe("KeeperBudget — cycle tx count cap", () => {
   });
 });
 
+describe("KeeperBudget — per-cycle window auto-reset", () => {
+  // Regression for the CRITICAL self-halt: the per-cycle counters used to be
+  // reset only by beginCycle(), which had no production caller, so they
+  // accumulated for the whole process lifetime and permanently latched a halt.
+  // They now reset on a time window with no caller required.
+
+  it("resets cycle spend + tx count once the window elapses, without beginCycle()", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    // Spend 802 of the 1_000 cycle cap across 2 txs — no manual reset.
+    b.recordTx(800, "crank", "success");
+    b.recordTx(2, "crank", "success");
+    expect(b.getStats().cycleSpend).toBe(802);
+    expect(b.getStats().cycleTxCount).toBe(2);
+    // Pre-roll, another 500 would breach (802 + 500 > 1_000).
+    clock.advance(30_000); // window elapses
+    expect(b.canSpend(500, "crank")).toBe(true); // window rolled → counters cleared
+    b.recordTx(500, "crank", "success");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(500); // reset to 0, then this tx
+    expect(s.cycleTxCount).toBe(1);
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("does not reset until the full window has elapsed", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    b.recordTx(900, "crank", "success");
+    clock.advance(29_999); // just under the window
+    expect(b.getStats().cycleSpend).toBe(900); // not yet rolled
+    clock.advance(1); // now exactly at the boundary
+    expect(b.getStats().cycleSpend).toBe(0); // rolled
+  });
+
+  it("a genuine within-window burst still trips the cap and latches (brake intact)", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success"); // maxTxPerCycle = 5
+    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.haltKind).toBe("cycle-tx-count-cap");
+  });
+
+  it("window roll does NOT clear a latched halt — resume() is still required", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, cycleWindowMs: 30_000 }, { now: clock.now });
+    for (let i = 0; i < 5; i++) b.recordTx(1, "crank", "success");
+    expect(b.canSpend(1, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    clock.advance(120_000); // several windows elapse
+    expect(b.isHalted()).toBe(true); // a real breach stays halted until a human resumes
+    expect(b.canSpend(1, "crank")).toBe(false);
+    b.resume("op");
+    expect(b.canSpend(1, "crank")).toBe(true);
+  });
+});
+
+describe("KeeperBudget — onResume hook", () => {
+  it("fires when a halt is cleared and lets callers reset a halted gauge", () => {
+    const clock = makeClock();
+    const onResume = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.haltManually("cordon");
+    expect(b.isHalted()).toBe(true);
+    b.resume("op");
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire when resume() is a no-op on a non-halted budget", () => {
+    const clock = makeClock();
+    const onResume = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.resume("op");
+    expect(onResume).not.toHaveBeenCalled();
+  });
+
+  it("onResume errors are caught and do not break resume()", () => {
+    const clock = makeClock();
+    const onResume = vi.fn(() => {
+      throw new Error("metric backend down");
+    });
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now, onResume });
+    b.haltManually("cordon");
+    expect(() => b.resume("op")).not.toThrow();
+    expect(b.isHalted()).toBe(false);
+  });
+});
+
 describe("KeeperBudget — success rate guard", () => {
   it("does not trip until min samples present", () => {
     const clock = makeClock();
@@ -229,6 +317,29 @@ describe("KeeperBudget — drop result accounting", () => {
     expect(s.hourSpend).toBe(0);
     expect(s.daySpend).toBe(0);
     expect(s.txWindowSize).toBe(0);
+  });
+});
+
+describe("KeeperBudget — reverted result accounting", () => {
+  it("counts toward tx count + spend but NOT the success-rate window", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: clock.now });
+    b.recordTx(300, "liquidation", "reverted");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(300); // fees were paid — the tx landed
+    expect(s.cycleTxCount).toBe(1);
+    expect(s.hourSpend).toBe(300);
+    expect(s.daySpend).toBe(300);
+    expect(s.txWindowSize).toBe(0); // excluded from the breaker
+  });
+
+  it("a flood of reverts never trips the tx-success-rate breaker", () => {
+    const clock = makeClock();
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, maxTxPerCycle: 999, maxSolPerCycle: 1e12, maxSolPerHour: 1e12, maxSolPerDay: 1e12 }, { now: clock.now });
+    for (let i = 0; i < 50; i++) b.recordTx(1, "liquidation", "reverted");
+    expect(b.canSpend(1, "crank")).toBe(true);
+    expect(b.isHalted()).toBe(false);
+    expect(b.getStats().txSuccessRate).toBeNull(); // no success/fail samples at all
   });
 });
 
@@ -335,5 +446,189 @@ describe("KeeperBudget — counter consistency under sequential ops", () => {
     const stats = b.getStats();
     expect(stats.hourSpend).toBeGreaterThanOrEqual(0);
     expect(stats.hourSpend).toBeLessThanOrEqual(stats.daySpend);
+  });
+});
+
+describe("KeeperBudget — non-finite cost guard", () => {
+  it("canSpend(NaN) refuses and halts (fail-safe), requiring resume()", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(NaN, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("non-finite-cost");
+    // stays halted for subsequent finite sends until resume()
+    expect(b.canSpend(1, "crank")).toBe(false);
+    b.resume("op");
+    expect(b.canSpend(1, "crank")).toBe(true);
+  });
+
+  it("canSpend(Infinity) refuses and halts (defense in depth)", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(Infinity, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("non-finite-cost");
+  });
+
+  it("fires onHalt with kind=non-finite-cost", () => {
+    const onHalt = vi.fn();
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now, onHalt });
+    b.canSpend(NaN, "crank");
+    expect(onHalt).toHaveBeenCalledWith("non-finite-cost", expect.any(String));
+  });
+
+  it("a NaN canSpend does not corrupt the reservation tallies", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    b.canSpend(NaN, "crank");
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().reservedTxCount).toBe(0);
+  });
+});
+
+describe("KeeperBudget — reservation / TOCTOU", () => {
+  it("a second in-flight send that only the reservation pushes over the cap is REFUSED, not halted", () => {
+    // cycle cap 1000; two 600-lamport sends in flight, neither recorded yet.
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true); // reserves 600
+    expect(b.canSpend(600, "crank")).toBe(false); // 0 + 600 reserved + 600 > 1000
+    // Concurrency back-pressure must NOT latch the breaker — nothing overspent.
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("a settled-spend breach still HALTS (unchanged semantics)", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true);
+    b.recordTx(600, "crank", "success"); // settled cycleSpend = 600, reservation released
+    // Next send's settled spend alone (600 + 600 = 1200) breaches the 1000 cap →
+    // this is a real overspend signal, so it HALTS (not mere back-pressure).
+    expect(b.canSpend(600, "crank")).toBe(false);
+    expect(b.isHalted()).toBe(true);
+    expect(b.haltKind).toBe("cycle-spend-cap");
+  });
+
+  it("reservation released on success: cycleSpend equals recorded amount, budget re-admits", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true);
+    b.recordTx(600, "crank", "success");
+    expect(b.getStats().cycleSpend).toBe(600);
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.canSpend(400, "crank")).toBe(true); // 600 + 0 + 400 == 1000, not > cap
+  });
+
+  it("reservation released on drop: nothing booked, reserve cleared, full budget free", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(900, "crank")).toBe(true);
+    b.recordTx(900, "crank", "drop");
+    expect(b.getStats().cycleSpend).toBe(0); // drop books nothing
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().cycleTxCount).toBe(1); // still an attempt
+    expect(b.canSpend(1_000, "crank")).toBe(true);
+  });
+
+  it("recordTx without a prior canSpend never drives the reserve negative", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    b.recordTx(500, "crank", "success"); // no reservation existed
+    expect(b.getStats().cycleSpend).toBe(500);
+    expect(b.getStats().reservedLamports).toBe(0);
+  });
+
+  it("reserved tx-count prevents concurrent overshoot of maxTxPerCycle without halting", () => {
+    // maxTxPerCycle = 5; wide spend caps so only the count matters.
+    const b = new KeeperBudget(
+      { ...TIGHT_CONFIG, maxSolPerCycle: 1_000_000, maxSolPerHour: 1_000_000, maxSolPerDay: 1_000_000 },
+      { now: makeClock().now },
+    );
+    for (let i = 0; i < 5; i++) expect(b.canSpend(1, "crank")).toBe(true); // reserve 5 tx
+    expect(b.canSpend(1, "crank")).toBe(false); // 0 + 5 reserved + 1 > 5 → refuse
+    expect(b.isHalted()).toBe(false);
+  });
+
+  it("beginCycle does not orphan in-flight reservations", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG, { now: makeClock().now });
+    expect(b.canSpend(600, "crank")).toBe(true); // reserve 600 (in flight)
+    b.beginCycle(); // a new cycle starts while the send is still on the wire
+    expect(b.getStats().reservedLamports).toBe(600); // reservation survives
+    // the in-flight send settles into the new cycle and releases its reservation
+    b.recordTx(600, "crank", "success");
+    expect(b.getStats().reservedLamports).toBe(0);
+    expect(b.getStats().cycleSpend).toBe(600);
+  });
+});
+
+describe("KeeperBudget — M12 adjustForRealizedCost", () => {
+  it("under-estimate (realized > estimated) bumps cycle/hour/day spend by the delta", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    let s = b.getStats();
+    expect(s.cycleSpend).toBe(100);
+    expect(s.realizedCostSamples).toBe(0);
+
+    b.adjustForRealizedCost(100, 150, "crank");
+    s = b.getStats();
+    expect(s.cycleSpend).toBe(150);
+    expect(s.hourSpend).toBe(150);
+    expect(s.daySpend).toBe(150);
+    expect(s.realizedCostDriftLamports).toBe(50);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("over-estimate (realized < estimated) decrements spend toward (but not below) zero", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    b.adjustForRealizedCost(100, 60, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(60);
+    expect(s.realizedCostDriftLamports).toBe(-40);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("clamps cycle/hour/day spend at 0 when a negative delta exceeds recorded spend", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(50, "crank", "success");
+    // Realized way smaller than estimated — delta = -200, spend was only 50.
+    b.adjustForRealizedCost(250, 50, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(0);
+    expect(s.hourSpend).toBe(0);
+    expect(s.daySpend).toBe(0);
+    // Drift telemetry still records the true (negative) signed delta.
+    expect(s.realizedCostDriftLamports).toBe(-200);
+    expect(s.realizedCostSamples).toBe(1);
+  });
+
+  it("ignores NaN / non-finite / negative inputs without bumping samples", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    b.recordTx(100, "crank", "success");
+    b.adjustForRealizedCost(Number.NaN, 200, "crank");
+    b.adjustForRealizedCost(100, Number.POSITIVE_INFINITY, "crank");
+    b.adjustForRealizedCost(-1, 200, "crank");
+    b.adjustForRealizedCost(100, -50, "crank");
+    const s = b.getStats();
+    expect(s.cycleSpend).toBe(100);
+    expect(s.realizedCostSamples).toBe(0);
+    expect(s.realizedCostDriftLamports).toBe(0);
+  });
+
+  it("accumulates drift across many tx — net positive drift surfaces under-estimation", () => {
+    const b = new KeeperBudget(TIGHT_CONFIG);
+    for (let i = 0; i < 10; i++) {
+      b.recordTx(100, "crank", "success");
+      // Consistently under-estimate by 10 lamports each tx.
+      b.adjustForRealizedCost(100, 110, "crank");
+    }
+    const s = b.getStats();
+    expect(s.realizedCostSamples).toBe(10);
+    expect(s.realizedCostDriftLamports).toBe(100); // 10 tx × 10 lamports
+    // cycleSpend = 10*100 recorded + 10*10 drift = 1100
+    expect(s.cycleSpend).toBe(1100);
+  });
+
+  it("never trips the cycle gate from realized adjustment alone if the recorded estimate fit", () => {
+    // Reproduces the M12 motivation: the canSpend gate already passed at estimatedCost.
+    // A small under-estimate should not retroactively halt the keeper for this tx — it
+    // just consumes more budget headroom for the next call.
+    const b = new KeeperBudget({ ...TIGHT_CONFIG, maxSolPerCycle: 200 });
+    b.recordTx(150, "crank", "success");
+    expect(b.canSpend(40, "crank")).toBe(true); // 150 + 40 = 190 < 200
+    b.adjustForRealizedCost(150, 170, "crank"); // now cycleSpend = 170
+    expect(b.canSpend(40, "crank")).toBe(false); // 170 + 40 = 210 > 200
   });
 });

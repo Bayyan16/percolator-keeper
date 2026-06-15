@@ -4,6 +4,20 @@ import type { RedisLike } from "./redis-client.js";
 
 const logger = createLogger("keeper:leader");
 
+// C2 (CRITICAL): SET XX is value-blind — under a partition+heal sequence
+// where a standby legitimately takes over after TTL expiry, a stale leader's
+// blind XX renewal would overwrite the new leader's identity and produce
+// split-brain. Atomic compare-and-pexpire: only refresh the TTL if the
+// stored value still matches our identity. PEXPIRE returns 1 on success,
+// the script returns 0 when our identity no longer owns the key.
+const RENEW_SCRIPT = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+else
+  return 0
+end
+`;
+
 export type LeaderRole = "leader" | "standby" | "starting";
 
 export interface LeaderLockOptions {
@@ -31,6 +45,15 @@ export class LeaderLock {
   private _renewFailures = 0;
   private _lockKey = "";
   private _onDemote: ((reason: string) => void) | null = null;
+  // Captured at start() so _demote() can re-enter the standby poll loop — it is
+  // the one transition that needs StartOptions but isn't handed them.
+  private _opts: StartOptions | null = null;
+  // Terminal kill-switch. Set true at the top of stop() BEFORE any await so an
+  // already-queued _poll/_renew callback (a timer that fired into the event
+  // loop microseconds before _clearTimers ran) cannot re-arm a timer or promote
+  // a node the operator has shut down. Role alone can't express this: stop()
+  // leaves the role as "standby", indistinguishable from a live standby.
+  private _stopped = false;
 
   constructor(redis: RedisLike, identity: string, opts: LeaderLockOptions = {}) {
     this.redis = redis;
@@ -47,6 +70,8 @@ export class LeaderLock {
   start(opts: StartOptions): void {
     this._lockKey = `keeper:leader:${opts.network}`;
     this._onDemote = opts.onDemote;
+    this._opts = opts;
+    this._stopped = false;
 
     logger.info("LeaderLock starting", {
       identity: this.identity,
@@ -60,6 +85,9 @@ export class LeaderLock {
   }
 
   async stop(): Promise<void> {
+    // Latch BEFORE _clearTimers() and before any await: a poll/renew callback
+    // already past clearTimeout's reach will observe this and abort.
+    this._stopped = true;
     this._clearTimers();
 
     if (this._role === "leader") {
@@ -98,6 +126,7 @@ export class LeaderLock {
   }
 
   private _promote(opts: StartOptions): void {
+    if (this._stopped) return;
     this._role = "leader";
     this._renewFailures = 0;
     logger.info("LeaderLock promoted to leader", { identity: this.identity });
@@ -113,25 +142,56 @@ export class LeaderLock {
   }
 
   private async _renew(opts: StartOptions): Promise<void> {
-    if (this._role !== "leader") return;
-
-    const ttlSec = Math.ceil(this.ttlMs / 1000);
+    if (this._stopped || this._role !== "leader") return;
 
     try {
-      const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, xx: true } as { ex: number; xx?: true });
+      // C2 (CRITICAL): fenced renewal via Lua EVAL. The script atomically
+      // verifies our identity still owns the lock before extending the TTL.
+      // Returns 1 on success, 0 if the lease has been lost (identity mismatch
+      // or key gone). Identity mismatch is a definitive loss of lease and
+      // demotes IMMEDIATELY — it is NOT a transient error and must bypass the
+      // 2-strike counter (which is reserved for thrown transport errors).
+      const result = await this.redis.eval<number | null>(
+        RENEW_SCRIPT,
+        [this._lockKey],
+        [this.identity, this.ttlMs],
+      );
 
-      if (result === "OK") {
+      if (result === 1) {
         this._renewFailures = 0;
         this._scheduleRenew(opts);
-      } else {
-        this._renewFailures++;
-        logger.warn("LeaderLock renew returned null (lock lost)", {
+        return;
+      }
+
+      // result === 0: our identity no longer owns the key (or key vanished
+      // mid-script). result === null/undefined: defensive — treat as lease
+      // loss rather than ambiguous transient. In either case, demote now.
+      if (result === 0 || result === null || result === undefined) {
+        logger.warn("LeaderLock renew fencing failed (lease lost) — demoting immediately", {
           identity: this.identity,
-          renewFailures: this._renewFailures,
+          result,
         });
         this._demote("redis-lock-lost");
+        return;
+      }
+
+      // Unexpected non-numeric/non-null result. Treat as transient so we do
+      // not demote spuriously on, e.g., an upstream protocol oddity.
+      this._renewFailures++;
+      logger.warn("LeaderLock renew returned unexpected value — treating as transient", {
+        identity: this.identity,
+        renewFailures: this._renewFailures,
+        result,
+      });
+      if (this._renewFailures >= 2) {
+        this._demote("redis-renew-failed");
+      } else {
+        this._scheduleRenew(opts);
       }
     } catch (err) {
+      // Transient transport error (network blip, 5xx, rate-limit). Preserve
+      // the existing 2-strike tolerance — this is the path the M15 finding
+      // discusses; tightening it is a separate PR.
       this._renewFailures++;
       logger.warn("LeaderLock renew error", {
         identity: this.identity,
@@ -149,6 +209,7 @@ export class LeaderLock {
   }
 
   private _enterStandby(opts: StartOptions): void {
+    if (this._stopped) return;
     this._role = "standby";
     logger.info("LeaderLock entering standby", { identity: this.identity });
     this._schedulePoll(opts);
@@ -162,14 +223,18 @@ export class LeaderLock {
   }
 
   private async _poll(opts: StartOptions): Promise<void> {
-    if (this._role !== "standby") return;
+    if (this._stopped || this._role !== "standby") return;
 
     try {
       const current = await this.redis.get(this._lockKey);
+      // stop() may have run while we were awaiting Redis — never promote or
+      // re-arm a timer on a stopped node.
+      if (this._stopped || this._role !== "standby") return;
 
       if (current === null) {
         const ttlSec = Math.ceil(this.ttlMs / 1000);
         const result = await this.redis.set(this._lockKey, this.identity, { ex: ttlSec, nx: true } as { ex: number; nx: true });
+        if (this._stopped || this._role !== "standby") return;
         if (result === "OK") {
           this._promote(opts);
           return;
@@ -182,6 +247,7 @@ export class LeaderLock {
         identity: this.identity,
         error: err instanceof Error ? err.message : String(err),
       });
+      if (this._stopped) return;
       this._schedulePoll(opts);
     }
   }
@@ -191,6 +257,14 @@ export class LeaderLock {
     this._role = "standby";
     this._clearTimers();
     logger.warn("LeaderLock demoted", { identity: this.identity, reason });
+    // Re-arm the standby poll so the node rejoins the election and re-acquires
+    // once Redis recovers and the lock frees — without this, a transient blip
+    // parks the node forever (services stopped via onDemote, never restarted).
+    // Scheduled BEFORE firing onDemote so recovery is armed even if the handler
+    // throws; _clearTimers() above guarantees no timer is live (no double-arm),
+    // and stop() (incl. one invoked from onDemote) latches _stopped and clears
+    // this poll. Mirrors _enterStandby()'s initial-standby behavior.
+    if (this._opts) this._schedulePoll(this._opts);
     this._onDemote?.(reason);
   }
 

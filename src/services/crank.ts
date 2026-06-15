@@ -666,12 +666,29 @@ export class CrankService {
   private readonly oracleService: OracleService;
   private lastCycleResult = { success: 0, failed: 0, skipped: 0 };
   private lastDiscoveryTime = 0;
-  // BC1: Signature replay protection
-  private recentSignatures = new Map<string, number>(); // signature -> timestamp
-  private readonly signatureTTLMs = 60_000; // 60 seconds
   private _isRunning = false;
   private _cycling = false;
   private _cycleStartedAt = 0;
+  // H4 (HIGH): wall-clock timestamp (ms) at which the watchdog first observed
+  // the current cycle exceeding MAX_CYCLE_MS. 0 when the watchdog is disarmed.
+  // The watchdog arms once, alerts once, and waits WATCHDOG_GRACE_MS before
+  // calling process.exit(1) for supervisor restart. It does NOT reset
+  // `_cycling` directly — flipping that flag while the in-flight cycle's
+  // Promise.all is still awaiting allows the next interval tick to launch a
+  // SECOND concurrent crankAll(), producing duplicate KeeperCrank txs +
+  // doubled funding accrual + RPC storms. Cleared on natural cycle recovery
+  // (the finally block) so transient slow cycles don't kill the process.
+  private _watchdogArmedAt = 0;
+  // M8: per-market in-flight guard. `_cycling` is a process-wide flag for
+  // the timer-driven crankAll cycle, but other entry points (registerMarket
+  // from the /register HTTP endpoint, and potentially LaserStream debounce
+  // handlers) can call crankMarket directly — bypassing `_cycling`. Without
+  // this guard, a /register HTTP arriving mid-cycle could fire crankMarket
+  // concurrently with crankAll's fan-out on the same slab, producing
+  // duplicate KeeperCrank txs for the same market. Set/delete at crankMarket
+  // entry/exit so every code path that reaches crankMarket honors the same
+  // in-flight invariant.
+  private _inflightMarkets = new Set<string>();
   private _stalePauseCheck?: (slabAddress: string) => boolean;
   // P1 FIX: Cache keypair at construction — was reading from disk on every crank cycle (every 30s)
   private readonly _keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
@@ -792,6 +809,10 @@ export class CrankService {
       // top of this file — drop the redundant dynamic import that used to run on every call.
       // B15: batch via getMultipleAccountsInfo with a per-call timeout on the fallback RPC.
       const conn = getFallbackConnection();
+      // Mirror registerMarket()'s owner allow-list (crank.ts: knownIds check):
+      // only track slabs owned by an allow-listed Percolator program, so the
+      // keeper never signs txs against an account owned by an arbitrary program.
+      const knownIds = new Set(config.allProgramIds);
       const pubkeys: Array<PublicKey | null> = slabAddresses.map((addr) => {
         try {
           return new PublicKey(addr);
@@ -823,6 +844,15 @@ export class CrankService {
           const info = infos[j];
           if (!info?.data) {
             logger.warn("MARKETS_FILTER: slab not found on-chain", { slab: pubkey.toBase58().slice(0, 8) });
+            continue;
+          }
+          // Security (main hardening): reject slabs owned by a non-allow-listed program
+          // before parsing — mirrors registerMarket. Prevents signing txs against a hostile program.
+          if (!knownIds.has(info.owner.toBase58())) {
+            logger.warn("MARKETS_FILTER: slab owned by non-allow-listed program — skipping", {
+              slab: pubkey.toBase58().slice(0, 8),
+              owner: info.owner.toBase58(),
+            });
             continue;
           }
           // DESYNC-1 FIX: route v17 accounts through parseWrapperConfigV17,
@@ -925,11 +955,13 @@ export class CrankService {
       }
       if (data) {
         const base58Re = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+        // M3: Validate each field independently — don't discard the entire row
+        // when only one field is invalid.
         for (const row of data) {
           const ca = row.mainnet_ca ?? undefined;
           if (ca && !base58Re.test(ca)) {
-            logger.warn("Invalid mainnet_ca from Supabase, ignoring", { slabAddress: row.slab_address, mainnetCA: ca });
-            continue;
+            logger.warn("Invalid mainnet_ca from Supabase, ignoring field", { slabAddress: row.slab_address, mainnetCA: ca });
+            ca = undefined;
           }
           dbMarkets.set(row.slab_address, { mainnetCA: ca });
         }
@@ -1096,6 +1128,15 @@ export class CrankService {
   }
 
   /**
+   * v17: HYPERP oracle mode (UpdateHyperpMark) was removed in v17 — tag 34 is now
+   * ConfigureHybridOracle. This stub always returns false to satisfy code paths from
+   * main that reference isHyperpOracle but are dead in the v17 branch.
+   */
+  private isHyperpOracle(_market: DiscoveredMarket): boolean {
+    return false;
+  }
+
+  /**
    * Build the account keys for PermissionlessCrank.
    *
    * v17 layout: [owner(s,w), market(w), portfolio(w), ...oracleTail(r)]
@@ -1191,6 +1232,17 @@ export class CrankService {
   }
 
   async crankMarket(slabAddress: string): Promise<boolean> {
+    // M8: per-market in-flight guard. Bail immediately if another caller is
+    // already running crankMarket for this slab. Closes the race where the
+    // /register HTTP endpoint and the timer-driven crankAll fan-out both
+    // dispatch crankMarket for the same market — pre-fix this could produce
+    // duplicate KeeperCrank txs since `_cycling` only gates the overall
+    // crankAll loop, not the per-market work.
+    if (this._inflightMarkets.has(slabAddress)) {
+      logger.debug("crankMarket: in-flight for slab, skipping concurrent call", { slabAddress });
+      return false;
+    }
+
     const state = this.markets.get(slabAddress);
     if (!state) {
       logger.warn("Market not found", { slabAddress });
@@ -1199,6 +1251,7 @@ export class CrankService {
 
     const { market } = state;
 
+    this._inflightMarkets.add(slabAddress);
     try {
       const connection = getConnection();
       const keypair = this._keypair;
@@ -1219,6 +1272,8 @@ export class CrankService {
       //
       // v17 CRITICAL: funding_rate_e9 is always hardcoded to 0n by the encoder.
       // The program hard-rejects any nonzero value with InvalidInstructionData.
+      // Note: HYPERP oracle mode (UpdateHyperpMark) was removed in v17. isHyperpOracle()
+      // always returns false so the HYPERP branch (M10 config refresh) is dead code.
 
       // Skip if we don't yet have a keeper portfolio for this market.
       // Portfolio provisioning is done at discover() time; log once per market.
@@ -1291,9 +1346,6 @@ export class CrankService {
         throw err;
       }
 
-      // BC1: Track signature to prevent replay attacks
-      this.recentSignatures.set(sig, Date.now());
-
       state.lastCrankTime = Date.now();
       state.successCount++;
       state.consecutiveFailures = 0;
@@ -1304,18 +1356,66 @@ export class CrankService {
       eventBus.publish("crank.success", slabAddress, { signature: sig });
       return true;
     } catch (err) {
-      state.failureCount++;
-      state.consecutiveFailures++;
-      txSentTotal.inc({ result: "fail", type: "crank" });
-
       const errMsg = err instanceof Error ? err.message : String(err);
+      const errLower = errMsg.toLowerCase();
 
-      // Detect permanent program rejections that won't resolve without admin action.
+      // N2: Classify transient RPC/network errors — these should not count toward
+      // the consecutiveFailures threshold that deactivates markets. A burst of 429s
+      // during RPC congestion should not disable a healthy market.
+      const isTransient =
+        errLower.includes("429") ||
+        errLower.includes("too many requests") ||
+        errLower.includes("rate limit") ||
+        errLower.includes("timeout") ||
+        errLower.includes("socket") ||
+        errLower.includes("econnrefused") ||
+        errLower.includes("econnreset") ||
+        errLower.includes("502") ||
+        errLower.includes("503") ||
+        errLower.includes("block height exceeded");
+
+      state.failureCount++;
+      txSentTotal.inc({ result: "fail", type: "crank" });
+      if (!isTransient) {
+        state.consecutiveFailures++;
+      } else {
+        logger.warn("Crank transient error — not counting toward deactivation", {
+          slabAddress,
+          error: errMsg.slice(0, 120),
+          consecutiveFailures: state.consecutiveFailures,
+        });
+      }
+      // M9: advance lastCrankTime on FAILURE too, not just success. Pre-fix,
+      // `isDue` checks `Date.now() - state.lastCrankTime >= interval`. With
+      // lastCrankTime only updated on success, a market that's been failing
+      // every cycle had a stale lastCrankTime (or 0 if it never succeeded),
+      // so isDue was always true. After 10 consecutive failures isActive
+      // flips to false and the keeper SHOULD back off from intervalMs (30s)
+      // to inactiveIntervalMs (120s) — but since lastCrankTime was stale,
+      // the back-off never fired. Advancing here makes the inactive interval
+      // honored: active-failing markets still retry every intervalMs (30s);
+      // deactivated markets retry every inactiveIntervalMs (120s) as designed.
+      state.lastCrankTime = Date.now();
+
+      // v17: Detect PermissionlessCrank-specific rejection (Custom 37 = LpVaultNoNewFees).
+      // This is not a permanent skip but indicates LP vault crank is a no-op this cycle.
       if (errMsg.includes("Custom\":37") || errMsg.includes("custom program error: 0x25")) {
-        logger.error("PermissionlessCrank rejected (Custom 37) — market configuration issue.", {
+        logger.error("PermissionlessCrank rejected (Custom 37 = LpVaultNoNewFees) — market configuration issue.", {
           slabAddress,
           programId: market.programId.toBase58(),
-          consecutiveFailures: state.consecutiveFailures + 1,
+          consecutiveFailures: state.consecutiveFailures,
+        });
+      }
+
+      // P1 FIX: Detect InsufficientDexLiquidity (error 0x33 = 51) specifically.
+      // Retained from main for completeness (dead in v17 since HYPERP was removed, but
+      // harmless to keep as a diagnostic if the error appears for other reasons).
+      if (errMsg.includes("Custom\":51") || errMsg.includes("custom program error: 0x33")) {
+        logger.error("InsufficientDexLiquidity — DEX pool does not meet program minimum liquidity threshold. " +
+          "Fix: use a pool with more liquidity, or redeploy the program with a lower MIN_DEX_QUOTE_LIQUIDITY.", {
+          slabAddress,
+          programId: market.programId.toBase58(),
+          consecutiveFailures: state.consecutiveFailures,
         });
       }
 
@@ -1365,6 +1465,11 @@ export class CrankService {
         error: err instanceof Error ? err.message : String(err),
       });
       return false;
+    } finally {
+      // M8: always release the per-market guard, even if the body throws or
+      // returns early. JavaScript runs finally after `return` in the try/catch
+      // above, so this fires on every code path.
+      this._inflightMarkets.delete(slabAddress);
     }
   }
 
@@ -1515,12 +1620,6 @@ export class CrankService {
       }
     }
 
-    // P2 FIX: Clean up stale signatures every cycle (was only on success path)
-    const now = Date.now();
-    for (const [oldSig, ts] of this.recentSignatures.entries()) {
-      if (now - ts > this.signatureTTLMs) this.recentSignatures.delete(oldSig);
-    }
-
     // P0 FIX: Always log cycle result with skip breakdown. Previously only logged
     // when failed > 0, causing skipped-only cycles to produce zero log output.
     logger.info("Crank cycle complete", {
@@ -1660,24 +1759,50 @@ export class CrankService {
     // above the worst normal Sender retry window.
     const MAX_CYCLE_MS = Math.max(this.intervalMs * 10, 4 * 60_000);
 
+    // H4 (HIGH): when the watchdog observes a cycle exceeding MAX_CYCLE_MS we
+    // give it `WATCHDOG_GRACE_MS` more before exiting the process. A slow but
+    // recovering cycle clears its own _cycling/_watchdogArmedAt via the
+    // finally block; a truly hung cycle hits process.exit and the supervisor
+    // restarts. Critically we never flip `_cycling=false` here — that was the
+    // pre-fix bug that let the next interval tick start a second crankAll()
+    // while the first was still mid-Sender-retry. See the field-comment on
+    // `_watchdogArmedAt` for the full rationale.
+    const WATCHDOG_GRACE_MS = 30_000;
+
     this.timer = setInterval(async () => {
       if (this._cycling) {
         const elapsed = Date.now() - this._cycleStartedAt;
         if (elapsed > MAX_CYCLE_MS) {
-          logger.error("Crank cycle watchdog: cycle exceeded max duration, force-resetting", {
-            elapsedMs: elapsed,
-            maxCycleMs: MAX_CYCLE_MS,
-          });
-          sendCriticalAlert("Crank cycle hung — watchdog reset", [
-            { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
-            { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
-          ])?.catch(() => {});
-          this._cycling = false;
+          if (this._watchdogArmedAt === 0) {
+            // First tick observing the hang — alert once, start grace timer.
+            this._watchdogArmedAt = Date.now();
+            logger.error("Crank cycle watchdog: cycle hung, grace period started before process exit", {
+              elapsedMs: elapsed,
+              maxCycleMs: MAX_CYCLE_MS,
+              graceMs: WATCHDOG_GRACE_MS,
+            });
+            sendCriticalAlert("Crank cycle hung — supervisor restart pending", [
+              { name: "Elapsed", value: `${Math.round(elapsed / 1000)}s`, inline: true },
+              { name: "Max", value: `${Math.round(MAX_CYCLE_MS / 1000)}s`, inline: true },
+              { name: "Grace", value: `${Math.round(WATCHDOG_GRACE_MS / 1000)}s`, inline: true },
+            ])?.catch(() => {});
+          } else if (Date.now() - this._watchdogArmedAt > WATCHDOG_GRACE_MS) {
+            // Grace expired, in-flight cycle did not recover — exit for supervisor restart.
+            // This is safer than flipping _cycling=false (which would double-execute) and
+            // safer than indefinite stall (which would silently halt the keeper).
+            logger.error("Crank cycle still hung after grace period — exiting for supervisor restart", {
+              elapsedMs: elapsed,
+              graceElapsedMs: Date.now() - this._watchdogArmedAt,
+            });
+            process.exit(1);
+          }
+          // NOTE: do NOT reset _cycling here. See field-comment on _watchdogArmedAt.
         }
         return;
       }
       this._cycling = true;
       this._cycleStartedAt = Date.now();
+      this._watchdogArmedAt = 0;
       try {
         // Only rediscover periodically (default 5min) to avoid RPC rate limits
         // PERC-8235: Don't use markets.size===0 as a trigger to rediscover every tick.
@@ -1704,9 +1829,12 @@ export class CrankService {
           }
         }
       } catch (err) {
-        logger.error("Crank cycle failed", { error: err });
+        logger.error("Crank cycle failed", { error: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined });
       } finally {
         this._cycling = false;
+        // H4: disarm the watchdog on natural recovery so a transient slow
+        // cycle doesn't carry a pending kill timer into the next cycle.
+        this._watchdogArmedAt = 0;
       }
     }, this.intervalMs);
   }

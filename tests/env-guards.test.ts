@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { Keypair } from "@solana/web3.js";
 import { validateKeeperEnvGuards } from "../src/env-guards.js";
 
 describe("validateKeeperEnvGuards", () => {
@@ -52,7 +53,7 @@ describe("validateKeeperEnvGuards", () => {
     expect(() => validateKeeperEnvGuards(env)).toThrow("must use wss://");
   });
 
-  it("allows insecure URLs when ALLOW_INSECURE_RPC=true", () => {
+  it("allows insecure URLs when ALLOW_INSECURE_RPC=true (non-mainnet)", () => {
     const env = {
       SOLANA_RPC_URL: "http://localhost:8899",
       SOLANA_RPC_WS_URL: "ws://localhost:8900",
@@ -60,6 +61,40 @@ describe("validateKeeperEnvGuards", () => {
     } as NodeJS.ProcessEnv;
 
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  // H9: ALLOW_INSECURE_RPC=true on mainnet exposes signed txs to MITM.
+  describe("H9: ALLOW_INSECURE_RPC=true rejected on mainnet", () => {
+    it("throws when ALLOW_INSECURE_RPC=true with NETWORK=mainnet", () => {
+      const env = {
+        SOLANA_RPC_URL: "http://some-rpc.helius.xyz",
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "mainnet",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /ALLOW_INSECURE_RPC.*not permitted.*mainnet/i,
+      );
+    });
+
+    it("throws when ALLOW_INSECURE_RPC=true with NETWORK=mainnet (via network.ts normalization)", () => {
+      const env = {
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: "https://mainnet.rpc.example.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /ALLOW_INSECURE_RPC.*not permitted.*mainnet/i,
+      );
+    });
+
+    it("allows ALLOW_INSECURE_RPC=true on devnet", () => {
+      const env = {
+        ALLOW_INSECURE_RPC: "true",
+        NETWORK: "devnet",
+        SOLANA_RPC_URL: "http://localhost:8899",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
   });
 
   it("does not throw for https:// and wss:// URLs", () => {
@@ -201,12 +236,12 @@ describe("validateKeeperEnvGuards", () => {
       );
     });
 
-    it("rejects mainnet+localhost even when ALLOW_INSECURE_RPC=true (separate guard)", () => {
-      // ALLOW_INSECURE_RPC bypasses the http:// guard but NOT the mainnet+localhost guard
+    it("rejects mainnet+localhost regardless of ALLOW_INSECURE_RPC (separate guard)", () => {
+      // H9 blocks ALLOW_INSECURE_RPC=true on mainnet entirely; the localhost guard
+      // independently fires when ALLOW_INSECURE_RPC is absent. Both paths reject.
       const env = {
         NETWORK: "mainnet",
-        SOLANA_RPC_URL: "http://localhost:8899",
-        ALLOW_INSECURE_RPC: "true",
+        SOLANA_RPC_URL: "https://localhost:8899",
       } as NodeJS.ProcessEnv;
       expect(() => validateKeeperEnvGuards(env)).toThrow(
         /SOLANA_RPC_URL points at .* but NETWORK=mainnet/,
@@ -269,6 +304,48 @@ describe("validateKeeperEnvGuards", () => {
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
   });
 
+  // ─── M1: CRANK_KEYPAIR parseability validation at boot ──────────────────
+  describe("M1: CRANK_KEYPAIR parseability", () => {
+    // A real, generated keypair — JSON-array form, which is the format
+    // operators typically paste into env vars from `solana-keygen new --outfile`.
+    const VALID_KEYPAIR_JSON = JSON.stringify(
+      Array.from(Keypair.generate().secretKey),
+    );
+
+    it("M1: throws when CRANK_KEYPAIR is a truncated JSON array", () => {
+      const env = { CRANK_KEYPAIR: "[1, 2, 3]" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: throws when CRANK_KEYPAIR is malformed JSON (unparseable)", () => {
+      const env = { CRANK_KEYPAIR: "[not, valid, json" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: throws when CRANK_KEYPAIR is a garbage base58 string", () => {
+      const env = { CRANK_KEYPAIR: "not-a-valid-base58-secret-!!!" } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /CRANK_KEYPAIR is not a valid keypair/,
+      );
+    });
+
+    it("M1: accepts a well-formed 64-byte JSON array keypair", () => {
+      const env = { CRANK_KEYPAIR: VALID_KEYPAIR_JSON } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    it("M1: does NOT require CRANK_KEYPAIR to be set (presence is enforced in index.ts)", () => {
+      // env-guards only validates parseability if CRANK_KEYPAIR is set.
+      // Boot-time presence is enforced at src/index.ts:33 before this runs.
+      const env = {} as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
+
   // A.7: RPC_URL is unguarded outside mainnet — local dev should still work.
   it("A.7: allows RPC_URL=http://localhost:8899 when NETWORK=devnet", () => {
     const env = {
@@ -277,5 +354,133 @@ describe("validateKeeperEnvGuards", () => {
       ALLOW_INSECURE_RPC: "true",
     } as NodeJS.ProcessEnv;
     expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+  });
+
+  // A8: mainnet must not silently fall back to devnet RPC. @percolatorct/shared
+  // defaults an unset FALLBACK_RPC_URL to api.devnet.solana.com, and the keeper
+  // runs all market discovery + liquidation retry on the fallback connection.
+  describe("A8: mainnet devnet/testnet RPC guard", () => {
+    const MAINNET = "https://mainnet.helius-rpc.com/?api-key=test";
+
+    it("throws when FALLBACK_RPC_URL is unset on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL must be set to a mainnet RPC endpoint/,
+      );
+    });
+
+    it("throws when FALLBACK_RPC_URL is whitespace-only on mainnet", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "   ",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL must be set to a mainnet RPC endpoint/,
+      );
+    });
+
+    it.each([
+      ["FALLBACK_RPC_URL", "https://api.devnet.solana.com"],
+      ["FALLBACK_RPC_URL", "https://devnet.helius-rpc.com/?api-key=test"],
+      ["FALLBACK_RPC_URL", "https://api.testnet.solana.com"],
+      ["SOLANA_RPC_URL", "https://api.devnet.solana.com"],
+      ["RPC_URL", "https://api.testnet.solana.com"],
+    ])("rejects %s pointing at a devnet/testnet host on mainnet", (varName, url) => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        [varName]: url,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        new RegExp(`${varName} points at devnet/testnet host`),
+      );
+    });
+
+    it("accepts a complete mainnet env with an explicit mainnet FALLBACK_RPC_URL", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        SOLANA_RPC_WS_URL: "wss://mainnet.helius-rpc.com/?api-key=test",
+        FALLBACK_RPC_URL: "https://api.mainnet-beta.solana.com",
+        RPC_URL: MAINNET,
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    // Label-anchored, not substring: a mainnet host that merely contains the
+    // text "devnet" inside a label is NOT a false positive.
+    it("does not reject a mainnet host containing 'devnet' as a substring", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: "https://my-devnet-migration.example.com",
+        RPC_URL: "https://my-devnet-migration.example.com",
+        FALLBACK_RPC_URL: "https://my-devnet-migration.example.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+
+    // The guard is independent of ALLOW_INSECURE_RPC (H9 blocks ALLOW_INSECURE_RPC=true
+    // on mainnet entirely; this test verifies the devnet-host guard fires on its own).
+    it("rejects a devnet fallback on mainnet (guard is independent of ALLOW_INSECURE_RPC)", () => {
+      const env = {
+        NETWORK: "mainnet",
+        SOLANA_RPC_URL: MAINNET,
+        RPC_URL: MAINNET,
+        FALLBACK_RPC_URL: "https://api.devnet.solana.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).toThrow(
+        /FALLBACK_RPC_URL points at devnet\/testnet host/,
+      );
+    });
+
+    it("does NOT require FALLBACK_RPC_URL off mainnet (devnet/unset)", () => {
+      expect(() => validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv)).not.toThrow();
+      expect(() => validateKeeperEnvGuards({} as NodeJS.ProcessEnv)).not.toThrow();
+    });
+
+    it("allows a devnet FALLBACK_RPC_URL when NETWORK=devnet", () => {
+      const env = {
+        NETWORK: "devnet",
+        FALLBACK_RPC_URL: "https://api.devnet.solana.com",
+      } as NodeJS.ProcessEnv;
+      expect(() => validateKeeperEnvGuards(env)).not.toThrow();
+    });
+  });
+
+  // A malformed JITO_TIP_LAMPORTS makes the tx-cost estimate NaN, which slips
+  // the budget circuit breaker's cap checks. Reject it at boot.
+  it("throws on non-numeric JITO_TIP_LAMPORTS", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "abc" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("throws on negative JITO_TIP_LAMPORTS", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "-1" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("throws on non-integer / trailing-garbage JITO_TIP_LAMPORTS (e.g. 200000abc)", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "200000abc" } as NodeJS.ProcessEnv),
+    ).toThrow(/JITO_TIP_LAMPORTS/);
+  });
+
+  it("accepts a valid integer JITO_TIP_LAMPORTS and accepts unset", () => {
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet", JITO_TIP_LAMPORTS: "200000" } as NodeJS.ProcessEnv),
+    ).not.toThrow();
+    expect(() =>
+      validateKeeperEnvGuards({ NETWORK: "devnet" } as NodeJS.ProcessEnv),
+    ).not.toThrow();
   });
 });

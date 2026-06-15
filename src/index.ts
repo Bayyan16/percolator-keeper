@@ -10,7 +10,8 @@ import { MonitorService } from "./services/monitor.js";
 import { FraudDetectorService } from "./services/fraud-detector.js";
 import { validateKeeperEnvGuards } from "./env-guards.js";
 import { isMainnet } from "./config/network.js";
-import { assertMainnetProgramId } from "./lib/boot-assertions.js";
+import { CURRENT_NETWORK } from "./network.js";
+import { assertMainnetProgramId, assertProgramIdAllowList } from "./lib/boot-assertions.js";
 import { snapshotMetrics as snapshotSenderMetrics } from "./lib/sender-metrics.js";
 import { walletBalanceSol, activeMarketsCount, registerDefaultMetrics } from "./lib/metrics.js";
 import * as metricsServer from "./lib/metrics-server.js";
@@ -19,6 +20,7 @@ import { LeaderLock, makeIdentity } from "./lib/leader.js";
 import { captureAndExit } from "./lib/exit-handlers.js";
 import { StartupTracker } from "./lib/startup-tracker.js";
 import { sharedTxQueue, DRAIN_TIMEOUT_MS } from "./lib/tx-queue.js";
+import { sharedBudget, setLeaderCheck } from "./lib/keeper-send.js";
 import { initSharedShadowHarness, sharedShadowHarness } from "./lib/shadow-harness.js";
 import { sharedDecisionLog } from "./lib/decision-log.js";
 
@@ -30,9 +32,31 @@ initSentry("keeper");
 
 const logger = createLogger("keeper");
 
+// M1: grace-gated deprecation of KEEPER_PRIVATE_KEY. The legacy alias used
+// to fall through silently with only `logger.warn` — operators had no
+// migration pressure and the deprecation was invisible on dashboards.
+// The fix:
+//   - if both vars are unset → throw (unchanged)
+//   - if CRANK_KEYPAIR is set → use it (unchanged; legacy is ignored)
+//   - if only KEEPER_PRIVATE_KEY is set → require an explicit opt-in
+//     (KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true) for one more release cycle.
+//     Otherwise throw with migration instructions.
+// Boot-time keypair parseability is validated by validateKeeperEnvGuards()
+// at line 42 — catches malformed input here rather than 60s later inside
+// the SOL-balance interval.
 if (!process.env.CRANK_KEYPAIR) {
   if (process.env.KEEPER_PRIVATE_KEY) {
-    logger.warn("KEEPER_PRIVATE_KEY is deprecated — rename to CRANK_KEYPAIR in your .env");
+    if (process.env.KEEPER_ALLOW_LEGACY_PRIVATE_KEY !== "true") {
+      throw new Error(
+        "KEEPER_PRIVATE_KEY is deprecated and will be removed in a future release. " +
+          "Rename it to CRANK_KEYPAIR in your .env / Railway config, OR set " +
+          "KEEPER_ALLOW_LEGACY_PRIVATE_KEY=true to keep using the legacy name " +
+          "for one more release cycle.",
+      );
+    }
+    logger.warn(
+      "KEEPER_PRIVATE_KEY fallback active — migration to CRANK_KEYPAIR required before next release",
+    );
     process.env.CRANK_KEYPAIR = process.env.KEEPER_PRIVATE_KEY;
   } else {
     throw new Error("CRANK_KEYPAIR must be set for keeper service");
@@ -41,10 +65,22 @@ if (!process.env.CRANK_KEYPAIR) {
 
 validateKeeperEnvGuards();
 
+// M2: cache the keeper signing keypair at boot. Previously `loadKeypair` was
+// called inside the 60s SOL-balance interval — re-parsing the same JSON/base58
+// every tick (wasteful) AND lumping keypair-format errors with RPC errors in
+// the catch block (silently degraded as warn). Hoisting the load to module
+// scope means a malformed keypair fails at boot (clean supervisor restart)
+// instead of producing a "keeper appears healthy but can't sign anything"
+// degraded state.
+const keeperKeypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+
 // If NETWORK=mainnet, the keeper runs against mainnet program (requires FORCE_MAINNET=1).
 // On mainnet, HYPERP markets (SOL-PERP, BTC-PERP, ETH-PERP) use the keeper as oracle authority
 // and price lookups use mainnet mints directly (no mainnetCA override needed).
 assertMainnetProgramId({ isMainnet: isMainnet(), programId: config.programId });
+// Validate the full discovery/signing program set (config.allProgramIds), not
+// just the single config.programId — discovery scans and signs against every entry.
+assertProgramIdAllowList({ isMainnet: isMainnet(), allProgramIds: config.allProgramIds });
 if (isMainnet()) {
   logger.info("Running in MAINNET mode", { programId: config.programId });
 }
@@ -77,6 +113,10 @@ if (haEnabled && redisClient === null) {
   logger.warn("HA_ENABLED=true but KEEPER_REDIS_URL is unset — running as standalone leader");
 }
 
+// Single-writer guard for keeperSend: only land on-chain txs while we hold
+// leadership. Reads the live LeaderLock role (standalone / no-HA → always leader).
+setLeaderCheck(() => (leaderLock ? leaderLock.role() === "leader" : true));
+
 // A5: gate /health on real readiness — Railway otherwise marks the container
 // healthy the moment the HTTP server binds, well before start() finishes
 // discovering markets and wiring services.
@@ -97,7 +137,12 @@ let _lastSolBalanceAlertTime = 0;
 
 const solBalanceCheckInterval = setInterval(async () => {
   try {
-    const keypair = loadKeypair(process.env.CRANK_KEYPAIR!);
+    // M2: reuse the keypair loaded at boot. The catch block below now only
+    // sees RPC errors, not keypair-format errors (those fail at boot when
+    // the module-scope loadKeypair call above throws). This lets ops
+    // distinguish "keeper can't sign" (boot failure) from "RPC outage"
+    // (transient warn).
+    const keypair = keeperKeypair;
     const conn = getConnection();
     const lamports = await conn.getBalance(keypair.publicKey);
     _keeperSolBalanceLamports = lamports;
@@ -218,6 +263,9 @@ crankService.setStalePauseCheck(isMarketStalePaused);
 // 6.2: Wire crank cycle counter into MonitorService so it can track ADL staleness
 crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 
+// ADL is observe-only — no tx notification hook needed. ADL staleness monitoring
+// in MonitorService tracks when preconditions are met, not when txs land.
+
 // A4: deleted the per-market setInterval loop that used to live here. It was
 // unreachable: crankService.getMarkets() is called at module load time, before
 // discover() has populated the map, so the forEach iterated an empty Map and
@@ -230,6 +278,13 @@ crankService.setOnCrankCycle(() => monitorService.notifyCrankCycle());
 // Health endpoint
 const startupTime = Date.now();
 const healthPort = Number(process.env.KEEPER_HEALTH_PORT ?? 8081);
+// L4: reject non-integer or out-of-range port values early so misconfiguration
+// is a startup failure rather than a confusing EACCES/EADDRINUSE at listen time.
+if (!Number.isInteger(healthPort) || healthPort < 1 || healthPort > 65535) {
+  throw new Error(
+    `Invalid KEEPER_HEALTH_PORT: "${process.env.KEEPER_HEALTH_PORT}" — must be an integer 1..65535`,
+  );
+}
 
 // Rate limiter for /register: max 5 failed auth attempts per IP per 60 seconds.
 // Prevents brute-force attacks against the shared secret.
@@ -385,6 +440,56 @@ res.writeHead(401, secureJsonHeaders);
     return;
   }
 
+  // POST /admin/budget/resume — clear a latched budget circuit-breaker halt
+  // without a full restart. Auth mirrors /register: x-shared-secret header
+  // matching KEEPER_REGISTER_SECRET, constant-time compare, per-IP rate limit.
+  if (req.url === "/admin/budget/resume" && req.method === "POST") {
+    const registerSecret = process.env.KEEPER_REGISTER_SECRET ?? "";
+    if (!registerSecret) {
+      req.resume();
+      res.writeHead(503, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Endpoint not configured" }));
+      return;
+    }
+
+    const clientIp = String(req.socket.remoteAddress ?? "unknown");
+    if (isRateLimited(clientIp)) {
+      logger.warn("Budget resume rate limited", { ip: clientIp });
+      req.resume();
+      res.writeHead(429, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Too many requests" }));
+      return;
+    }
+
+    const provided = String(req.headers["x-shared-secret"] ?? "");
+    const secretBuf = Buffer.from(registerSecret, "utf8");
+    const providedBuf = Buffer.from(provided, "utf8");
+    const maxLen = Math.max(secretBuf.length, providedBuf.length, 1);
+    const secretPad = Buffer.alloc(maxLen);
+    const providedPad = Buffer.alloc(maxLen);
+    secretBuf.copy(secretPad);
+    providedBuf.copy(providedPad);
+    const lengthMatch = secretBuf.length === providedBuf.length;
+    const contentMatch = timingSafeEqual(secretPad, providedPad);
+    if (!lengthMatch || !contentMatch) {
+      recordAuthFailure(clientIp);
+      req.resume();
+      res.writeHead(401, secureJsonHeaders);
+      res.end(JSON.stringify({ success: false, message: "Unauthorized" }));
+      return;
+    }
+
+    req.resume(); // drain the request body — we don't need it
+    const operator = String(req.headers["x-operator"] ?? `http:${clientIp}`);
+    const wasHalted = sharedBudget.isHalted();
+    const previousHaltKind = sharedBudget.haltKind ?? null;
+    sharedBudget.resume(operator);
+    logger.warn("Budget resume requested via endpoint", { operator, wasHalted, previousHaltKind });
+    res.writeHead(200, secureJsonHeaders);
+    res.end(JSON.stringify({ success: true, wasHalted, previousHaltKind, stats: sharedBudget.getStats() }));
+    return;
+  }
+
   if (req.url === "/health" && req.method === "GET") {
     // A5: hard 503 until start() resolved. Railway otherwise marks the
     // container healthy as soon as healthServer.listen() returns — long
@@ -489,6 +594,20 @@ res.writeHead(401, secureJsonHeaders);
       invariants: monitorService.getStatus(),
       // Task 1.8: Sender land-rate + tip-spend metrics for Phase 1 rollout observability
       senderMetrics: snapshotSenderMetrics(),
+      // Budget circuit-breaker state — surfaced so a latched halt is visible on
+      // dashboards without scraping /metrics. Recover via POST /admin/budget/resume.
+      budget: (() => {
+        const s = sharedBudget.getStats();
+        return {
+          halted: s.halted,
+          haltKind: s.haltKind ?? null,
+          cycleSpend: s.cycleSpend,
+          cycleTxCount: s.cycleTxCount,
+          hourSpend: s.hourSpend,
+          daySpend: s.daySpend,
+          txSuccessRate: s.txSuccessRate,
+        };
+      })(),
     };
     
     const currentRole = leaderLock ? leaderLock.role() : "leader";
@@ -648,7 +767,10 @@ async function start() {
     // A.3: env-guards asserts NETWORK is set to mainnet|devnet whenever
     // HA_ENABLED=true, so the previous `?? "devnet"` fallback is gone —
     // a missing NETWORK would silently share a lock with the wrong cluster.
-    const network = process.env.NETWORK!;
+    // Use the normalized CURRENT_NETWORK (not raw process.env.NETWORK) so two
+    // nodes differing only by case/whitespace ("Mainnet" vs "mainnet") derive
+    // the SAME lock key and cannot both become leader.
+    const network = CURRENT_NETWORK;
     leaderLock.start({
       network,
       onPromote: () => {
@@ -657,6 +779,10 @@ async function start() {
       },
       onDemote: (reason) => {
         logger.warn("HA: demoted from leader — stopping services", { network, reason });
+        // role() is already "standby" here (LeaderLock flips it before onDemote fires),
+        // so the keeperSend single-writer guard is already closed. Drop any queued
+        // sends so this node runs no backlog after losing leadership.
+        sharedTxQueue.clearPending();
         stopAllServices();
       },
     });
@@ -668,6 +794,13 @@ async function start() {
   // B13: bind the health port only after every service is wired up. Wrapped in
   // a Promise so start() awaits the bind callback before resolving — otherwise
   // a concurrent /health probe could land between this call and start() resolving.
+  // L3: HTTP server hardening — prevent slowloris and resource exhaustion.
+  // These must be set before listen() so they take effect on the first connection.
+  healthServer.requestTimeout = 10_000;  // 10s max for entire request
+  healthServer.headersTimeout = 5_000;   // 5s max to receive all headers
+  healthServer.keepAliveTimeout = 5_000; // 5s keep-alive idle timeout
+  healthServer.maxConnections = 50;      // cap concurrent connections
+
   // In HA mode the health port still binds here; startupTracker reports
   // "starting" until services actually wire up via onPromote.
   await new Promise<void>((resolve, reject) => {

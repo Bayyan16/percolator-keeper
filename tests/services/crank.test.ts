@@ -334,6 +334,53 @@ describe('CrankService', () => {
       expect(isDueAt121s).toBe(true);
     });
 
+    // M9: lastCrankTime must advance on FAILURE too, not just success. Pre-fix,
+    // a market failing every cycle had a stale lastCrankTime, so the isDue
+    // back-off (from 30s active → 120s inactive after 10 failures) never
+    // actually fired — the keeper kept cranking the dead market every 30s.
+    it('M9: lastCrankTime advances on failure (inactive back-off interval is honored)', async () => {
+      const slabAddress = 'MarketM9LastCrankAaaaaaaaaaaaaaaaaaaaaaa';
+      const mockMarket = {
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'MintM9111111111111111111111111111111111' },
+          oracleAuthority: { toBase58: () => '11111111111111111111111111111111', equals: () => true },
+          indexFeedId: { toBytes: () => new Uint8Array(32) },
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM9Last1111111111111111111111111111' } },
+      };
+
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
+      await crankService.discover();
+
+      // Anchor time. A fresh market has lastCrankTime=0 (never cranked).
+      const t0 = 1_700_000_000_000;
+      vi.setSystemTime(t0);
+
+      const stateBefore = crankService.getMarkets().get(slabAddress)!;
+      expect(stateBefore.lastCrankTime).toBe(0);
+
+      // First crankMarket attempt fails. lastCrankTime must advance.
+      vi.mocked(keeperSendModule.keeperSend).mockRejectedValue(new Error('rpc error'));
+      const result = await crankService.crankMarket(slabAddress);
+      expect(result).toBe(false);
+
+      const stateAfterOneFailure = crankService.getMarkets().get(slabAddress)!;
+      expect(stateAfterOneFailure.consecutiveFailures).toBe(1);
+      expect(stateAfterOneFailure.lastCrankTime).toBe(t0);
+      //                                        ↑ pre-fix this would be 0 (never updated)
+
+      // Move time forward 15s and fail again. lastCrankTime must advance to t0+15s.
+      vi.setSystemTime(t0 + 15_000);
+      await crankService.crankMarket(slabAddress);
+      const stateAfterTwoFailures = crankService.getMarkets().get(slabAddress)!;
+      expect(stateAfterTwoFailures.lastCrankTime).toBe(t0 + 15_000);
+
+      vi.useRealTimers();
+    });
+
     it('should mark market inactive after 10 consecutive failures', async () => {
       const slabAddress = 'Market611111111111111111111111111111111';
       const mockMarket = {
@@ -408,6 +455,74 @@ describe('CrankService', () => {
           simulateForCU: false,
         }),
       );
+    });
+
+    // M8: per-market in-flight guard. The /register HTTP endpoint and the
+    // timer-driven crankAll fan-out both call crankMarket directly. Pre-fix,
+    // a /register HTTP arriving mid-cycle could fire a duplicate KeeperCrank
+    // tx for the same slab. The guard makes concurrent crankMarket calls for
+    // the same slab a no-op (second call returns false immediately).
+    //
+    // We test the contract directly via the private `_inflightMarkets` set
+    // rather than racing async timing — the latter proved fragile across
+    // machines.
+    it('M8: crankMarket bails when slab is already in _inflightMarkets (no send)', async () => {
+      const slabAddress = 'MarketM8GuardAaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      vi.mocked(core.discoverMarkets).mockResolvedValue([{
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          indexFeedId: { toBytes: () => new Uint8Array(32).fill(1) },
+          oracleAuthority: { toBase58: () => 'NonZeroAuth1111111111111111111111111111111' },
+          authorityPriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM8G11111111111111111111111111111111' } },
+      }] as any);
+      await crankService.discover();
+
+      const sendSpy = vi.mocked(keeperSendModule.keeperSend);
+      sendSpy.mockClear();
+
+      // Simulate "another caller is already in flight" by pre-populating the set.
+      const inflight: Set<string> = (crankService as any)._inflightMarkets;
+      inflight.add(slabAddress);
+
+      const result = await crankService.crankMarket(slabAddress);
+
+      expect(result).toBe(false);
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      // Clean up so this test doesn't pollute later tests in the suite.
+      inflight.delete(slabAddress);
+    });
+
+    it('M8: _inflightMarkets is empty before AND after a crankMarket call (released by finally)', async () => {
+      const slabAddress = 'MarketM8ReleaseAaaaaaaaaaaaaaaaaaaaaaaaa';
+      vi.mocked(core.discoverMarkets).mockResolvedValue([{
+        slabAddress: { toBase58: () => slabAddress },
+        programId: { toBase58: () => '11111111111111111111111111111111' },
+        config: {
+          collateralMint: { toBase58: () => 'So11111111111111111111111111111111111111112' },
+          indexFeedId: { toBytes: () => new Uint8Array(32).fill(1) },
+          oracleAuthority: { toBase58: () => 'NonZeroAuth1111111111111111111111111111111' },
+          authorityPriceE6: 1_000_000n,
+          authorityTimestamp: BigInt(Math.floor(Date.now() / 1000)),
+        },
+        params: { maintenanceMarginBps: 500n },
+        header: { admin: { toBase58: () => 'AdminM8R11111111111111111111111111111111' } },
+      }] as any);
+      await crankService.discover();
+
+      const inflight: Set<string> = (crankService as any)._inflightMarkets;
+      expect(inflight.has(slabAddress)).toBe(false);
+
+      await crankService.crankMarket(slabAddress);
+
+      // Whether the body succeeded or failed, the finally clause must release.
+      expect(inflight.has(slabAddress)).toBe(false);
     });
   });
 
@@ -657,102 +772,37 @@ describe('CrankService', () => {
       expect(state.successCount).toBe(1);
     });
 
-    it.skip('should call recordPushTime after successful bundled price push', async () => {
-      const slabAddress = 'MarketPushTime111111111111111111111111';
-      const KEEPER_KEY = '11111111111111111111111111111111';
-      const KEEPER_AUTH = 'KeeperAuth11111111111111111111111111111';
-
-      vi.mocked(shared.loadKeypair).mockReturnValue({
-        publicKey: {
-          toBase58: () => KEEPER_AUTH,
-          equals: (other: any) => other?.toBase58?.() === KEEPER_AUTH,
-        },
-        secretKey: new Uint8Array(64),
-      } as any);
-
-      const localCrank = new CrankService(mockOracleService);
-
-      const mockMarket = {
-        slabAddress: { toBase58: () => slabAddress },
-        programId: { toBase58: () => KEEPER_KEY },
-        config: {
-          collateralMint: { toBase58: () => 'MintPush1111111111111111111111111111111' },
-          oracleAuthority: {
-            toBase58: () => KEEPER_AUTH,
-            equals: (other: any) => other?.toBase58?.() === KEEPER_AUTH,
-          },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-          authorityPriceE6: BigInt(1_000_000),
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminPush111111111111111111111111111111' } },
-      };
-
-      vi.mocked(core.discoverMarkets).mockResolvedValue([mockMarket] as any);
-      await localCrank.discover();
-
-      mockOracleService.fetchPrice = vi.fn().mockResolvedValue({ priceE6: BigInt(50_000_000), source: 'dexscreener', timestamp: Date.now() });
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-push-time', estimatedCost: 5000 } as any);
-
-      try {
-        const result = await localCrank.crankMarket(slabAddress);
-        expect(result).toBe(true);
-        expect(mockOracleService.recordPushTime).toHaveBeenCalledWith(slabAddress);
-      } finally {
-        localCrank.stop();
-      }
-    });
-
-    it('crankAll should count foreignOracleSkipped markets in skipped total', async () => {
+    // Post-Phase-G: the "foreign oracle" skip (admin-push oracle requiring the keeper
+    // to be the oracle authority) was removed. A market with a non-zero oracle authority
+    // and index_feed_id == 0 is a normal HYPERP market and must be cranked, not skipped.
+    // (The two prior tests that asserted the skip behavior were deleted with this change.)
+    it('Post-Phase-G: a market with a non-zero (foreign) oracle authority is cranked as HYPERP, not skipped', async () => {
       const slabForeign = 'MarketFO3111111111111111111111111111111';
-      const slabNormal = 'MarketNorm111111111111111111111111111111';
-      const FOREIGN_AUTH = 'ForeignAuth31111111111111111111111111111';
       const mockForeignMarket = {
         slabAddress: { toBase58: () => slabForeign },
         programId: { toBase58: () => '11111111111111111111111111111111' },
         config: {
           collateralMint: { toBase58: () => 'MintFO31111111111111111111111111111111' },
-          // Non-default, non-keeper oracle authority → isAdminOracle=true, keeper≠authority
-          oracleAuthority: {
-            toBase58: () => FOREIGN_AUTH,
-            equals: (_other: any) => false, // not PublicKey.default AND not keeper key
-          },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
+          // Non-default, non-keeper oracle authority — the old "foreign oracle" case.
+          oracleAuthority: { toBase58: () => 'ForeignAuth31111111111111111111111111111', equals: (_o: any) => false },
+          indexFeedId: { toBytes: () => new Uint8Array(32) }, // index_feed_id == 0 → HYPERP
+          authorityPriceE6: BigInt(50_000_000), // mark already set → not hyperp-no-price-skipped
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'AdminFO31111111111111111111111111111111' } },
       };
-      const mockNormalMarket = {
-        slabAddress: { toBase58: () => slabNormal },
-        programId: { toBase58: () => '11111111111111111111111111111111' },
-        config: {
-          collateralMint: { toBase58: () => 'MintNorm1111111111111111111111111111111' },
-          oracleAuthority: { toBase58: () => '11111111111111111111111111111111', equals: () => true },
-          indexFeedId: { toBytes: () => new Uint8Array(32) },
-        },
-        params: { maintenanceMarginBps: 500n },
-        header: { admin: { toBase58: () => 'AdminNorm111111111111111111111111111111' } },
-      };
 
-      // GH#1251: crankAll now calls loadKeypair() for a live authority check.
-      // Keeper key must NOT match oracleAuthority so the foreign market is skipped.
+      // Keeper key does NOT match the foreign oracle authority — pre-fix this forced a skip.
       vi.mocked(shared.loadKeypair).mockReturnValue({
-        publicKey: {
-          toBase58: () => 'KeeperKey311111111111111111111111111111',
-          equals: (_other: any) => false, // keeper ≠ foreign oracle authority
-        },
+        publicKey: { toBase58: () => 'KeeperKey311111111111111111111111111111', equals: (_o: any) => false },
         secretKey: new Uint8Array(64),
       } as any);
 
-      vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket, mockNormalMarket] as any);
+      vi.mocked(core.discoverMarkets).mockResolvedValue([mockForeignMarket] as any);
       await crankService.discover();
       setKeeperPortfolios(crankService);
 
-      // Pre-mark the foreign oracle market as skipped (as crankMarket would do in steady state)
-      const foreignState = crankService.getMarkets().get(slabForeign)!;
-      foreignState.foreignOracleSkipped = true;
-
-      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-normal', estimatedCost: 5000 } as any);
+      vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'sig-foreign', estimatedCost: 5000 } as any);
       const result = await crankService.crankAll();
 
       // Normal market cranked; foreign oracle market skipped → skipped >= 1
@@ -821,12 +871,7 @@ describe('CrankService', () => {
 
       // The foreign oracle market should be SKIPPED, not failed
       expect(result.failed).toBe(0);
-      expect(result.skipped).toBeGreaterThanOrEqual(1);
-      expect(result.success).toBe(1);
-
-      // Confirm the flag was re-set by crankAll's live check
-      const stateAfter = crankService.getMarkets().get(slabForeign)!;
-      expect(stateAfter.foreignOracleSkipped).toBe(true);
+      expect(result.success).toBeGreaterThanOrEqual(1);
     });
   });
 
@@ -924,20 +969,30 @@ describe('CrankService', () => {
       }
     });
 
-    it.skip('PERC-1254: should crank Hyperp market once fetchPrice returns a valid price', async () => {
+    // v17: HYPERP oracle mode (UpdateHyperpMark, tag 34) was removed — tag 34 is now
+    // ConfigureHybridOracle. The tests below are from main's HYPERP hardening (PR fixes
+    // for the seedable-market wedge, DEX-pool fallback, no-pool skip). They are kept as
+    // it.skip() because hyperpNoPriceSkipped / dexPoolAddress / dexPoolRemainingAccounts
+    // fields were not ported to v17 MarketCrankState and UpdateHyperpMark does not exist.
+    it.skip('PoC (main): a seedable HYPERP market is wrongly skipped by crankAll before UpdateHyperpMark can seed it', async () => {
+      // v17: not applicable — UpdateHyperpMark removed. Test preserved for reference.
+    });
+
+    it.skip('main: still skips a zero-mark HYPERP market with NO DEX pool', async () => {
+      // v17: not applicable.
+    });
+
+    it.skip('main: cranks a zero-mark HYPERP market seedable via Supabase DEX-pool fallback', async () => {
+      // v17: not applicable.
+    });
+
+    it.skip('PERC-1254: skips an unseeded HYPERP market with no DEX pool, then cranks it once a pool is configured', async () => {
       vi.mocked(keeperSendModule.keeperSend).mockResolvedValue({ signature: 'mock-sig', estimatedCost: 5000 } as any);
 
       const slabHyperp = 'HyperpWithPrice111111111111111111111111';
       const ZERO_BYTES = new Uint8Array(32);
       const KEEPER_PUBKEY_STR2 = '11111111111111111111111111111112';
-
-      const keeperOracleAuth2 = {
-        toBase58: () => KEEPER_PUBKEY_STR2,
-        equals: (other: any) => {
-          if (other?.toBase58) return other.toBase58() === KEEPER_PUBKEY_STR2;
-          return false;
-        },
-      };
+      const POOL = 'So11111111111111111111111111111111111111112';
 
       // Set mock BEFORE constructing the local service so _keypair cache picks it up.
       vi.mocked(shared.loadKeypair).mockReturnValue({
@@ -957,9 +1012,15 @@ describe('CrankService', () => {
         config: {
           collateralMint: { toBase58: () => 'Mint3111111111111111111111111111111111' },
           indexFeedId: { toBytes: () => ZERO_BYTES, equals: (o: any) => false },
-          oracleAuthority: keeperOracleAuth2,
-          authorityPriceE6: BigInt(0),
+          // Keeper is the (vestigial) authority — under the old code this forced a
+          // skip even once a pool was available; it must not anymore.
+          oracleAuthority: {
+            toBase58: () => KEEPER_PUBKEY_STR2,
+            equals: (other: any) => other?.toBase58?.() === KEEPER_PUBKEY_STR2,
+          },
+          authorityPriceE6: BigInt(0), // unseeded
           lastEffectivePriceE6: BigInt(1_000_000),
+          dexPool: null, // no pinned DEX pool yet → genuinely un-seedable this cycle
         },
         params: { maintenanceMarginBps: 500n },
         header: { admin: { toBase58: () => 'Admin311111111111111111111111111111111' } },
@@ -968,18 +1029,21 @@ describe('CrankService', () => {
       vi.mocked(core.discoverMarkets).mockResolvedValue([hyperpMarket as any]);
 
       try {
-        // First cycle: no price
-        mockOracleService.fetchPrice = vi.fn().mockResolvedValue(null);
+        // First cycle: zero mark AND no DEX pool → un-seedable → skipped (not failed).
         await localCrank.discover();
         const result1 = await localCrank.crankAll();
         expect(result1.failed).toBe(0);
-        const stateAfterSkip = localCrank.getMarkets().get(slabHyperp)!;
-        expect(stateAfterSkip.hyperpNoPriceSkipped).toBe(true);
+        expect(result1.skipped).toBe(1);
+        const state = localCrank.getMarkets().get(slabHyperp)!;
+        expect(state.hyperpNoPriceSkipped).toBe(true);
 
-        // Second cycle: price available — should clear flag and crank
-        mockOracleService.fetchPrice = vi.fn().mockResolvedValue({ priceE6: BigInt(75_000_000) });
-        // Simulate discovery reset (as discover() does)
-        stateAfterSkip.hyperpNoPriceSkipped = false;
+        // A DEX pool is now configured (admin SetDexPool / Supabase). The market
+        // becomes seedable, so crankMarket sends UpdateHyperpMark + crank. Pre-cache
+        // the resolved pool metadata so the build skips the RPC vault lookup.
+        state.hyperpNoPriceSkipped = false;
+        state.dexPoolAddress = POOL;
+        state.dexPoolResolvedAddress = POOL;
+        state.dexPoolRemainingAccounts = [];
 
         const result2 = await localCrank.crankMarket(slabHyperp);
         expect(result2).toBe(true);
@@ -1040,6 +1104,122 @@ describe('CrankService', () => {
 
       crankService.stop();
       expect(crankService.isRunning).toBe(false);
+    });
+  });
+
+  // ─── H4 (HIGH): watchdog must not let a second crank cycle launch while the first ──
+  // ─── is still in-flight, and must trigger supervisor restart on a genuine hang.   ──
+  // Pre-fix bug: watchdog set `_cycling=false` when elapsed > MAX_CYCLE_MS, letting
+  // the next interval tick run `crankAll()` concurrently with the in-flight one →
+  // duplicate KeeperCrank txs, doubled funding, RPC storms.
+  describe('H4: watchdog double-execution guard', () => {
+    let exitSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      // Mock process.exit so the test doesn't actually kill vitest. The fix calls
+      // process.exit(1) when a cycle hangs beyond MAX_CYCLE_MS + WATCHDOG_GRACE_MS.
+      exitSpy = vi.spyOn(process, 'exit').mockImplementation(((_code?: number) => undefined) as never);
+    });
+
+    afterEach(() => {
+      // Stop the keeper + restore timers + restore process.exit BEFORE the next
+      // test, even if this one timed out — otherwise the leftover setInterval
+      // leaks fake-timer state into subsequent describe blocks.
+      crankService.stop();
+      vi.useRealTimers();
+      exitSpy.mockRestore();
+    });
+
+    // Pre-populates a single dummy market so start() bypasses its initial
+    // `await this.discover()` (which hangs under fake timers when called
+    // before discoverMarkets() resolves). Then under fake timers we can
+    // observe the setInterval ticks directly.
+    function prepStartedService(): void {
+      (crankService as any).markets.set('dummy-slab', {
+        slabAddress: 'dummy-slab',
+        market: {},
+        lastCrankTime: Date.now(),
+        successCount: 0,
+        failureCount: 0,
+        isActive: true,
+        consecutiveErrors: 0,
+      });
+    }
+
+    // Pump the interval into the watchdog branch. _cycling is pre-staged so
+    // the watchdog branch runs synchronously and we never enter the
+    // crankAll/discover path (which would await mocked RPCs and stall the
+    // fake-timer scheduler).
+    function setCyclingHung(elapsedMs: number = 6 * 60_000) {
+      (crankService as any)._cycling = true;
+      (crankService as any)._cycleStartedAt = Date.now() - elapsedMs;
+    }
+
+    it('H4: does NOT reset _cycling when watchdog observes a hung cycle', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start(); // sync return — markets is non-empty so discover is skipped
+      setCyclingHung(); // 6 min elapsed > 5 min MAX_CYCLE_MS
+
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      expect((crankService as any)._cycling).toBe(true);
+      expect((crankService as any)._watchdogArmedAt).toBeGreaterThan(0);
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('H4: alerts once even across multiple watchdog ticks within grace', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+      const alertSpy = vi.mocked(shared.sendCriticalAlert);
+      alertSpy.mockClear();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      // Re-stage so _cycling stays true and elapsed stays > MAX_CYCLE_MS for the next tick.
+      setCyclingHung();
+      await vi.advanceTimersByTimeAsync(15_000); // still inside grace
+
+      expect(alertSpy).toHaveBeenCalledTimes(1);
+      const [title] = alertSpy.mock.calls[0]!;
+      expect(title).toContain('hung');
+    });
+
+    it('H4: process.exit(1) fires after grace period if cycle stays hung', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(exitSpy).not.toHaveBeenCalled();
+
+      setCyclingHung();
+      // Advance well past the 30s grace boundary (>= 31s + small slop). The check
+      // is strictly >, so being inside the same fake-time tick that equals exactly
+      // 30s wouldn't fire — give it a comfortable margin.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('H4: watchdog disarms cleanly when cycle is no longer hung', async () => {
+      prepStartedService();
+      vi.useFakeTimers();
+      void crankService.start();
+      setCyclingHung();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect((crankService as any)._watchdogArmedAt).toBeGreaterThan(0);
+
+      // Simulate the in-flight cycle recovering: _cycling=true with elapsed
+      // under MAX_CYCLE_MS means the watchdog skips the hung branch entirely.
+      setCyclingHung(1_000); // 1s elapsed, well under 5min cap
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      // Next watchdog tick should NOT fire process.exit, because elapsed is now < MAX_CYCLE_MS.
+      expect(exitSpy).not.toHaveBeenCalled();
     });
   });
 
