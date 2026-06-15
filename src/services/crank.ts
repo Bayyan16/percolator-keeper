@@ -49,7 +49,8 @@ const RPC_TIMEOUT_MS = 15_000;
  *
  * Stored at bytes [0..8] of every v17 percolator-owned account.
  * Used as the memcmp filter key for getProgramAccounts discovery of v17 markets.
- * Base58 encoding of these bytes: "111111111Gt1X1" — use memcmp offset=0 bytes base58.
+ * Correct encodings of these LE bytes: base58 "1347Wxtvn4w", base64 "ADYxVkNSRVA=".
+ * The runtime memcmp uses base64 (encoding:"base64") below — do NOT copy a wrong base58 here.
  *
  * DESYNC-1 FIX: The legacy discoverMarkets() SDK function checks for the old
  * TALOCREP magic (0x504552434f4c4154) and will never find v17 accounts. We
