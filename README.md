@@ -64,6 +64,7 @@ docker run --env-file .env percolator-keeper
 | `KEEPER_HEALTH_PORT` | ❌ | Health check port (default: 8081) |
 | `KEEPER_REGISTER_SECRET` | ❌ | Shared secret for `/register` endpoint |
 | `ADL_ENABLED` | ❌ | Set to `true` to enable ADL service |
+
 > Security note: Do not commit real `.env` files, private keys, RPC API keys, or Supabase secrets. Use `.env.example` as a template and keep local secrets out of git.
 
 ## License
