@@ -59,11 +59,13 @@ docker run --env-file .env percolator-keeper
 | `CRANK_KEYPAIR` | ✅ | Keeper wallet private key (base58) or path to keypair JSON |
 | `SUPABASE_URL` | ✅ | Supabase project URL |
 | `SUPABASE_KEY` | ✅ | Supabase anon key (for keeper runtime) |
-| `SUPABASE_SERVICE_ROLE_KEY` | ✅ | Supabase service role key (must differ from `SUPABASE_KEY`) |
+| `SUPABASE_SERVICE_ROLE_KEY` | ❌ | Do not provide this for keeper runtime. Use `SUPABASE_KEY` anon key only. |
 | `SENTRY_DSN` | ❌ | Sentry error tracking DSN |
 | `KEEPER_HEALTH_PORT` | ❌ | Health check port (default: 8081) |
 | `KEEPER_REGISTER_SECRET` | ❌ | Shared secret for `/register` endpoint |
 | `ADL_ENABLED` | ❌ | Set to `true` to enable ADL service |
+
+> Security note: Do not commit real `.env` files, private keys, RPC API keys, or Supabase secrets. Use `.env.example` as a template and keep local secrets out of git.
 
 ## License
 
