@@ -178,26 +178,25 @@ describe("@percolatorct/sdk exports — encodePermissionlessCrank (v17 replaceme
   });
 });
 
-// ── 4. encodeLiquidateAtOracle round-trip ─────────────────────────────────────
+// ── 4. encodeLiquidateAtOracle removal guard (v17) ─────────────────────────────
+// v17: LiquidateAtOracle (tag 7) is not accepted by the deployed wrapper.
+// PermissionlessCrank is the supported liquidation path.
 
-describe("@percolatorct/sdk exports — encodeLiquidateAtOracle (keeper)", () => {
+describe("@percolatorct/sdk exports — encodeLiquidateAtOracle removal guard (v17)", () => {
   it("encodeLiquidateAtOracle is a function", () => {
     expect(typeof encodeLiquidateAtOracle).toBe("function");
   });
 
-  it("encodeLiquidateAtOracle({targetIdx:0}) returns a 3-byte Uint8Array", () => {
-    const data = encodeLiquidateAtOracle({ targetIdx: 0 });
-    expect(data).toBeInstanceOf(Uint8Array);
-    // 1 byte tag + 2 bytes targetIdx = 3 bytes
-    expect(data.length).toBe(3);
+  it("encodeLiquidateAtOracle throws at runtime — use PermissionlessCrank instead", () => {
+    expect(() => encodeLiquidateAtOracle({ targetIdx: 0 })).toThrow(
+      /PermissionlessCrank/,
+    );
   });
 
-  it("encodeLiquidateAtOracle tag byte is IX_TAG.LiquidateAtOracle (7)", () => {
-    const data = encodeLiquidateAtOracle({ targetIdx: 42 });
-    expect(data[0]).toBe(7);
-    // targetIdx=42 in LE u16 = 0x2a 0x00
-    expect(data[1]).toBe(42);
-    expect(data[2]).toBe(0);
+  it("encodeLiquidateAtOracle throws for any targetIdx", () => {
+    expect(() => encodeLiquidateAtOracle({ targetIdx: 42 })).toThrow(
+      /LiquidateAtOracle/,
+    );
   });
 });
 
@@ -220,18 +219,19 @@ describe("@percolatorct/sdk exports — encodeExecuteAdl removal guard (v17)", (
   });
 });
 
-// ── 6. encodeUpdateHyperpMark round-trip ──────────────────────────────────────
+// ── 6. encodeUpdateHyperpMark removal guard (v17) ─────────────────────────────
+// v17: v12 DEX-pool mark crank tag 34 is not accepted by the deployed wrapper.
+// Use ConfiguredHybridOracle, PermissionlessCrank, or the supported mark refresh path.
 
-describe("@percolatorct/sdk exports — encodeUpdateHyperpMark (keeper/crank)", () => {
+describe("@percolatorct/sdk exports — encodeUpdateHyperpMark removal guard (v17)", () => {
   it("encodeUpdateHyperpMark is a function", () => {
     expect(typeof encodeUpdateHyperpMark).toBe("function");
   });
 
-  it("encodeUpdateHyperpMark() returns a 1-byte Uint8Array with value 34", () => {
-    const data = encodeUpdateHyperpMark();
-    expect(data).toBeInstanceOf(Uint8Array);
-    expect(data.length).toBe(1);
-    expect(data[0]).toBe(34);
+  it("encodeUpdateHyperpMark throws at runtime — use supported v17 mark refresh paths", () => {
+    expect(() => encodeUpdateHyperpMark()).toThrow(
+      /ConfiguredHybridOracle|PermissionlessCrank|mark refresh/,
+    );
   });
 });
 
