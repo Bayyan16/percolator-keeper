@@ -22,6 +22,13 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - name: Checkout linked SDK dependency
+        run: git clone --depth 1 https://github.com/dcccrypto/percolator-sdk.git ../../percolator-sdk
+      - name: Build linked SDK dependency
+        working-directory: ../../percolator-sdk
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test
