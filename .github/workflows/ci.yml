@@ -23,7 +23,12 @@ jobs:
           node-version: 22
           cache: pnpm
       - name: Checkout linked SDK dependency
-        run: git clone --depth 1 https://github.com/dcccrypto/percolator-sdk.git ../../percolator-sdk
+        run: |
+          mkdir -p ../../percolator-sdk
+          git -C ../../percolator-sdk init
+          git -C ../../percolator-sdk remote add origin https://github.com/dcccrypto/percolator-sdk.git
+          git -C ../../percolator-sdk fetch --depth 1 origin 5b140ae20dbb2e322da8687c7338f7d53821ee81
+          git -C ../../percolator-sdk checkout --detach FETCH_HEAD
       - name: Build linked SDK dependency
         working-directory: ../../percolator-sdk
         run: |
