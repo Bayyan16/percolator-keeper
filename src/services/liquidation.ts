@@ -398,6 +398,46 @@ export class LiquidationService {
   }
 
   /**
+   * Shared liquidation target guard for both polling and LaserStream event paths.
+   *
+   * Semantics: the event-driven path intentionally shares the polling cycle guard
+   * state. A target reserved by polling cannot be re-submitted by an event burst
+   * before the next polling cycle clears the guard state. Polling remains active
+   * as the slow-path safety net and resets the window at the start of each cycle.
+   */
+  private _reserveLiquidationCandidate(
+    candidate: LiquidationCandidate,
+    source: "polling" | "event",
+  ): boolean {
+    const positionKey = candidate.v17PortfolioPubkey
+      ? `${candidate.slabAddress}:${candidate.v17PortfolioPubkey.toBase58()}`
+      : `${candidate.slabAddress}:${candidate.accountIdx}`;
+
+    if (this._cycleSeenPositions.has(positionKey)) {
+      logger.debug("Skipping position already targeted this cycle", {
+        positionKey,
+        owner: candidate.owner.slice(0, 8),
+        source,
+      });
+      return false;
+    }
+
+    const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
+    if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
+      logger.debug("Owner hit per-cycle liquidation cap", {
+        owner: candidate.owner.slice(0, 8),
+        cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
+        source,
+      });
+      return false;
+    }
+
+    this._cycleSeenPositions.add(positionKey);
+    this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
+    return true;
+  }
+
+  /**
    * Scan a single market for undercollateralized accounts.
    *
    * DESYNC-3/4 FIX: v17 market accounts have different magic bytes (PERCV16\0)
@@ -925,25 +965,7 @@ export class LiquidationService {
         // C1: dedup per on-chain (slab, accountIdx) position; rate-limit per
         // owner across the cycle.
         for (const candidate of candidates) {
-          const positionKey = `${candidate.slabAddress}:${candidate.accountIdx}`;
-          if (this._cycleSeenPositions.has(positionKey)) {
-            logger.debug("Skipping position already targeted this cycle", {
-              positionKey,
-              owner: candidate.owner.slice(0, 8),
-            });
-            continue;
-          }
-          // Main hardening: rate-limit per owner across the cycle (prevents hammering one wallet).
-          const ownerCount = this._cycleOwnerCounts.get(candidate.owner) ?? 0;
-          if (ownerCount >= LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE) {
-            logger.debug("Owner hit per-cycle liquidation cap", {
-              owner: candidate.owner.slice(0, 8),
-              cap: LiquidationService.MAX_LIQ_PER_OWNER_PER_CYCLE,
-            });
-            continue;
-          }
-          this._cycleSeenPositions.add(positionKey);
-          this._cycleOwnerCounts.set(candidate.owner, ownerCount + 1);
+          if (!this._reserveLiquidationCandidate(candidate, "polling")) continue;
           // v17: pass portfolioPubkey for DESYNC-3; scanPriceE6 for drift guard (main hardening).
           const sig = await this.liquidate(
             filteredBatch[j]!.market,
@@ -1056,6 +1078,7 @@ export class LiquidationService {
             // Single-market scan — fire-and-forget; errors logged inside scanMarket.
             this.scanMarket(market.market).then(async (candidates) => {
               for (const c of candidates) {
+                if (!this._reserveLiquidationCandidate(c, "event")) continue;
                 const sig = await this.liquidate(market.market, c.accountIdx, c.v17PortfolioPubkey, c.scanPriceE6);
                 if (sig) {
                   logger.info("Event-driven liquidation complete", {
