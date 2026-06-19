@@ -921,6 +921,22 @@ export class CrankService {
               // Ignore parse errors — market state stays at last known good.
             }
           }
+
+          // v17 markets need a keeper-owned portfolio before PermissionlessCrank
+          // can run. Normal rediscovery retries this when keeperPortfolio is
+          // still null; keep the LaserStream fast path consistent so a transient
+          // provisioning failure does not leave an already-known market
+          // discovered-but-uncrankable until the next full rediscovery.
+          const header = state.market.header as
+            | { version?: number | bigint; kind?: number | bigint }
+            | undefined;
+          const isV17Market =
+            Boolean((state.market as DiscoveredMarket & { _rawV17Config?: unknown })._rawV17Config) ||
+            (header !== undefined && Number(header.version) === 16 && Number(header.kind) === 1);
+
+          if (isV17Market && !state.keeperPortfolio) {
+            this.ensureKeeperPortfolio(key, state.market);
+          }
         }
         this.lastDiscoveryTime = now;
         logger.debug("LaserStream fast-path discover complete", {

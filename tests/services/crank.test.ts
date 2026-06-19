@@ -158,6 +158,109 @@ describe('CrankService', () => {
       expect(crankService.getMarkets().size).toBe(1);
     });
 
+    it('LaserStream fast-path retries v17 keeper portfolio provisioning when keeperPortfolio is null', async () => {
+      const prevLaserStream = process.env.KEEPER_USE_LASERSTREAM;
+      process.env.KEEPER_USE_LASERSTREAM = 'true';
+
+      try {
+        const slabAddress = new PublicKey('11111111111111111111111111111111');
+
+        const mockCache = {
+          getOwnerVerified: vi.fn(() => null),
+        };
+
+        const mockAccountLoader = {
+          getCache: vi.fn(() => mockCache),
+          getStats: vi.fn(() => ({ lastSlot: 123 })),
+          getProgramId: vi.fn(() => new PublicKey('11111111111111111111111111111111')),
+        };
+
+        const service = new CrankService(mockOracleService, undefined, mockAccountLoader as any);
+
+        const mockMarket = {
+          slabAddress,
+          programId: new PublicKey('11111111111111111111111111111111'),
+          config: {
+            collateralMint: new PublicKey('11111111111111111111111111111111'),
+            oracleAuthority: PublicKey.default,
+            indexFeedId: { toBytes: () => new Uint8Array(32) },
+          },
+          params: { maintenanceMarginBps: 500n },
+          header: { admin: PublicKey.default, version: 16, kind: 1 },
+          _rawV17Config: {},
+        };
+
+        const legacySlabAddress = new PublicKey('So11111111111111111111111111111111111111112');
+        const legacyMarket = {
+          ...mockMarket,
+          slabAddress: legacySlabAddress,
+          header: { admin: PublicKey.default, version: 12, kind: 0 },
+          _rawV17Config: undefined,
+        };
+
+        // Simulate a v17 market already discovered earlier, but portfolio provisioning failed.
+        // In this state, crankMarket() skips because keeperPortfolio is still null.
+        (service as any).markets.set(slabAddress.toBase58(), {
+          market: mockMarket,
+          lastCrankTime: 0,
+          successCount: 0,
+          failureCount: 0,
+          consecutiveFailures: 0,
+          isActive: true,
+          missingDiscoveryCount: 0,
+          keeperPortfolio: null,
+        });
+
+        // Also include a legacy/non-v17 market with keeperPortfolio null.
+        // The fast-path retry must not attempt v17 portfolio provisioning for it.
+        (service as any).markets.set(legacySlabAddress.toBase58(), {
+          market: legacyMarket,
+          lastCrankTime: 0,
+          successCount: 0,
+          failureCount: 0,
+          consecutiveFailures: 0,
+          isActive: true,
+          missingDiscoveryCount: 0,
+          keeperPortfolio: null,
+        });
+
+        // Keep discover() inside the LaserStream fast-path instead of full rediscovery.
+        (service as any)._lastFullRediscoverTime = Date.now();
+
+        const getProgramAccounts = vi.fn().mockResolvedValue([]);
+        const getMinimumBalanceForRentExemption = vi.fn().mockResolvedValue(1);
+
+        vi.mocked(shared.getConnection).mockClear();
+        vi.mocked(shared.getConnection).mockReturnValueOnce({
+          getAccountInfo: vi.fn(),
+          getSlot: vi.fn().mockResolvedValue(200),
+          getProgramAccounts,
+          getMinimumBalanceForRentExemption,
+        } as any);
+
+        await service.discover();
+
+        // The fast-path should retry the v17 portfolio provisioning path only once:
+        // for the v17 market with keeperPortfolio=null, not for the legacy market.
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(shared.getConnection).toHaveBeenCalledTimes(1);
+        expect(getProgramAccounts).toHaveBeenCalledTimes(1);
+        expect(getProgramAccounts.mock.calls[0]?.[0]).toBe(mockMarket.programId);
+        expect(getProgramAccounts.mock.calls[0]?.[1]?.filters).toContainEqual({ dataSize: 9347 });
+
+        service.stop();
+      } finally {
+        if (prevLaserStream === undefined) {
+          delete process.env.KEEPER_USE_LASERSTREAM;
+        } else {
+          process.env.KEEPER_USE_LASERSTREAM = prevLaserStream;
+        }
+      }
+    });
+
     it('should handle discovery errors per program without crashing', async () => {
       vi.mocked(core.discoverMarkets)
         .mockRejectedValueOnce(new Error('Program 1 failed'))
