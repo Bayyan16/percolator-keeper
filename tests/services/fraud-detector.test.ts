@@ -396,12 +396,68 @@ describe("FraudDetectorService", () => {
     const mainnetCA = "So11111111111111111111111111111111111111112";
     const state = makeHyperpState({ markPriceE6: 1_000_000n, mainnetCA });
     const markets = new Map([["slab1", state]]);
-    const oracle = makeMockOracle({ priceE6: 1_000_000n, source: "dexscreener", timestamp: Date.now() });
+    const oracle = makeMockOracle({
+      priceE6: 1_000_000n,
+      source: "dexscreener",
+      timestamp: Date.now(),
+    });
 
     const svc = new FraudDetectorService(oracle, () => markets);
     await svc._runCheck();
 
     // fetchPrice should be called with mainnetCA, not the collateral mint
     expect(oracle.fetchPrice).toHaveBeenCalledWith(mainnetCA, "slab1");
+  });
+
+  // ── malformed env config PoC ───────────────────────────────────────────────
+
+  it("falls back to the default divergence threshold when FRAUD_DETECT_DIVERGENCE_BPS is malformed", async () => {
+    process.env.FRAUD_DETECT_DIVERGENCE_BPS = "abc";
+    mockWarnAlertFn.mockReturnValue(Promise.resolve());
+
+    // on-chain: $1.01, off-chain: $1.00 → 100 bps.
+    // With the default 500 bps threshold, this should NOT alert.
+    const onChain = 1_010_000n;
+    const offChain = 1_000_000n;
+
+    const state = makeHyperpState({ markPriceE6: onChain });
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({
+      priceE6: offChain,
+      source: "dexscreener",
+      timestamp: Date.now(),
+    });
+
+    const svc = new FraudDetectorService(oracle, () => markets);
+    await svc._runCheck();
+
+    expect(mockWarnAlertFn).not.toHaveBeenCalled();
+    expect(mockFraudAlertTotal.inc).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the default cooldown when FRAUD_DETECT_PER_MINT_COOLDOWN_MS is negative", async () => {
+    process.env.FRAUD_DETECT_DIVERGENCE_BPS = "500";
+    process.env.FRAUD_DETECT_PER_MINT_COOLDOWN_MS = "-1";
+    mockWarnAlertFn.mockReturnValue(Promise.resolve());
+
+    vi.useFakeTimers();
+    const now = Date.now();
+    vi.setSystemTime(now);
+
+    const state = makeHyperpState({ markPriceE6: 2_000_000n });
+    const markets = new Map([["slab1", state]]);
+    const oracle = makeMockOracle({
+      priceE6: 1_000_000n,
+      source: "dexscreener",
+      timestamp: Date.now(),
+    });
+
+    const svc = new FraudDetectorService(oracle, () => markets);
+
+    await svc._runCheck();
+    await svc._runCheck();
+
+    expect(mockWarnAlertFn).toHaveBeenCalledTimes(1);
+    expect(mockFraudAlertTotal.inc).toHaveBeenCalledTimes(1);
   });
 });
