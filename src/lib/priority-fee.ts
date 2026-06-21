@@ -9,6 +9,22 @@ export type PriorityFeeTier = "crank" | "liquidation" | "oracle" | "adl";
 const FALLBACK_MICROLAMPORTS = 1_000;
 const DEFAULT_CACHE_MS = 5_000;
 const DEFAULT_CACHE_MAX_ENTRIES = 1_000;
+function parseBoundedIntEnv(
+  name: string,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    return fallback;
+  }
+
+  return value;
+}
 
 /** Default percentiles per tier (overridable via env). ADL is liquidation-priority. */
 const DEFAULT_PERCENTILES: Record<PriorityFeeTier, number> = {
@@ -93,12 +109,13 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
       "";
     this._cacheMs =
       opts?.cacheMs ??
-      parseInt(process.env.KEEPER_PRIORITY_FEE_CACHE_MS ?? String(DEFAULT_CACHE_MS), 10);
+      parseBoundedIntEnv("KEEPER_PRIORITY_FEE_CACHE_MS", DEFAULT_CACHE_MS, 1);
     this._cacheMaxEntries =
       opts?.cacheMaxEntries ??
-      parseInt(
-        process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES ?? String(DEFAULT_CACHE_MAX_ENTRIES),
-        10,
+      parseBoundedIntEnv(
+        "KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES",
+        DEFAULT_CACHE_MAX_ENTRIES,
+        1,
       );
   }
 

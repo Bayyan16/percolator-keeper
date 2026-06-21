@@ -270,5 +270,48 @@ describe("HeliusPriorityFeeEstimator", () => {
         else process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = origEnv;
       }
     });
+
+        it("falls back to default cache duration when KEEPER_PRIORITY_FEE_CACHE_MS is malformed", async () => {
+      const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MS;
+      process.env.KEEPER_PRIORITY_FEE_CACHE_MS = "abc";
+
+      try {
+        const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+        global.fetch = fetchFn;
+
+        const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com");
+
+        await estimator.estimate(["acc1"], "crank");
+        await estimator.estimate(["acc1"], "crank");
+
+        expect(fetchFn).toHaveBeenCalledTimes(1);
+      } finally {
+        if (origEnv === undefined) delete process.env.KEEPER_PRIORITY_FEE_CACHE_MS;
+        else process.env.KEEPER_PRIORITY_FEE_CACHE_MS = origEnv;
+      }
+    });
+
+    it("falls back to default cache cap when KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES is malformed", async () => {
+      const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES;
+      process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = "abc";
+
+      try {
+        const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+        global.fetch = fetchFn;
+
+        const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com", {
+          cacheMs: 60_000,
+        });
+
+        for (let i = 0; i < 1_005; i++) {
+          await estimator.estimate([`acc${i}`], "crank");
+        }
+
+        expect(cacheSize(estimator)).toBeLessThanOrEqual(1_000);
+      } finally {
+        if (origEnv === undefined) delete process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES;
+        else process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = origEnv;
+      }
+    });
   });
 });
