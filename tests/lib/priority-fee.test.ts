@@ -291,6 +291,26 @@ describe("HeliusPriorityFeeEstimator", () => {
       }
     });
 
+        it("preserves zero cache duration as an explicit env override", async () => {
+      const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MS;
+      process.env.KEEPER_PRIORITY_FEE_CACHE_MS = "0";
+
+      try {
+        const fetchFn = mockFetch(HELIUS_SUCCESS_RESPONSE);
+        global.fetch = fetchFn;
+
+        const estimator = new HeliusPriorityFeeEstimator("https://rpc.example.com");
+
+        await estimator.estimate(["acc1"], "crank");
+        await estimator.estimate(["acc1"], "crank");
+
+        expect(fetchFn).toHaveBeenCalledTimes(2);
+      } finally {
+        if (origEnv === undefined) delete process.env.KEEPER_PRIORITY_FEE_CACHE_MS;
+        else process.env.KEEPER_PRIORITY_FEE_CACHE_MS = origEnv;
+      }
+    });
+
     it("falls back to default cache cap when KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES is malformed", async () => {
       const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES;
       process.env.KEEPER_PRIORITY_FEE_CACHE_MAX_ENTRIES = "abc";

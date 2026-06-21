@@ -109,7 +109,7 @@ export class HeliusPriorityFeeEstimator implements PriorityFeeEstimator {
       "";
     this._cacheMs =
       opts?.cacheMs ??
-      parseBoundedIntEnv("KEEPER_PRIORITY_FEE_CACHE_MS", DEFAULT_CACHE_MS, 1);
+      parseBoundedIntEnv("KEEPER_PRIORITY_FEE_CACHE_MS", DEFAULT_CACHE_MS, 0);
     this._cacheMaxEntries =
       opts?.cacheMaxEntries ??
       parseBoundedIntEnv(
