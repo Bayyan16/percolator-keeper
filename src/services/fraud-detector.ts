@@ -59,15 +59,47 @@ export function divergenceBps(onchain: bigint | number, offchain: bigint | numbe
 }
 
 // Config
+const DEFAULT_INTERVAL_MS = 30_000;
+const DEFAULT_DIVERGENCE_THRESHOLD_BPS = 500;
+const DEFAULT_PER_MINT_COOLDOWN_MS = 1_800_000;
+
+function parseBoundedIntEnv(
+  name: string,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    return fallback;
+  }
+
+  return value;
+}
+
 function getIntervalMs(): number {
-  return parseInt(process.env.FRAUD_DETECT_INTERVAL_MS ?? "30000", 10);
+  return parseBoundedIntEnv("FRAUD_DETECT_INTERVAL_MS", DEFAULT_INTERVAL_MS, 1_000);
 }
+
 function getDivergenceThresholdBps(): number {
-  return parseInt(process.env.FRAUD_DETECT_DIVERGENCE_BPS ?? "500", 10);
+  return parseBoundedIntEnv(
+    "FRAUD_DETECT_DIVERGENCE_BPS",
+    DEFAULT_DIVERGENCE_THRESHOLD_BPS,
+    0,
+  );
 }
+
 function getPerMintCooldownMs(): number {
-  return parseInt(process.env.FRAUD_DETECT_PER_MINT_COOLDOWN_MS ?? "1800000", 10);
+  return parseBoundedIntEnv(
+    "FRAUD_DETECT_PER_MINT_COOLDOWN_MS",
+    DEFAULT_PER_MINT_COOLDOWN_MS,
+    0,
+  );
 }
+
 function isEnabled(): boolean {
   return process.env.FRAUD_DETECT_ENABLED !== "false";
 }
