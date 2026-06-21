@@ -271,7 +271,7 @@ describe("HeliusPriorityFeeEstimator", () => {
       }
     });
 
-        it("falls back to default cache duration when KEEPER_PRIORITY_FEE_CACHE_MS is malformed", async () => {
+    it("falls back to default cache duration when KEEPER_PRIORITY_FEE_CACHE_MS is malformed", async () => {
       const origEnv = process.env.KEEPER_PRIORITY_FEE_CACHE_MS;
       process.env.KEEPER_PRIORITY_FEE_CACHE_MS = "abc";
 
