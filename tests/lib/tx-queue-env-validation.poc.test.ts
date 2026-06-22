@@ -1,4 +1,4 @@
-﻿import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 
 vi.mock("@percolatorct/shared", () => ({
   createLogger: vi.fn(() => ({
@@ -27,7 +27,7 @@ describe("TxQueue env validation", () => {
     vi.clearAllMocks();
   });
 
-  it("falls back for non-positive env values instead of constructing an invalid queue", async () => {
+  it("falls back for invalid concurrency and cap values while allowing zero-ms intervals", async () => {
     process.env.TX_QUEUE_CRANK_CONCURRENCY = "0";
     process.env.TX_QUEUE_CRANK_INTERVAL_CAP = "-1";
     process.env.TX_QUEUE_CRANK_INTERVAL_MS = "0";
