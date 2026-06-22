@@ -55,10 +55,11 @@ export interface TxLaneStats {
 }
 
 function parseEnvInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined) return fallback;
-  const n = parseInt(raw, 10);
-  return isNaN(n) ? fallback : n;
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
 function buildLaneConfig(lane: TxLane, defaults: { concurrency: number; intervalCap: number; interval: number }) {
